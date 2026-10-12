@@ -104,6 +104,17 @@ class CBWorkerDeadError(RuntimeError):
     """
 
 
+def _cb_rejection_error(cb: "ContinuousBatchingManager", request_id: str) -> Exception:
+    """Build the error for an `add_request` that did not accept the request."""
+    fatal_error = cb.background_thread_status.fatal_error
+    if fatal_error is not None:
+        return CBWorkerDeadError(f"CB worker is dead and cannot accept request {request_id}: {fatal_error}")
+    reason = cb.background_thread_status.can_accept_new_requests()
+    if reason:
+        return RuntimeError(f"Continuous batching rejected request {request_id}: {reason}")
+    return RuntimeError(f"Continuous batching rejected request {request_id}.")
+
+
 # Fallback response_template per model_type for tokenizers that don't ship one.
 _RESPONSE_TEMPLATE_FALLBACKS = {
     (
@@ -888,22 +899,17 @@ class CBGenerateManager(BaseGenerateManager):
         if cb is None:
             raise RuntimeError("CB manager not initialized. Call `init_cb()` first.")
         self._check_alive(request_id)
-
-        loop = asyncio.get_running_loop()
-        text_queue: asyncio.Queue = asyncio.Queue()
+        # Reject before building the streamer. A dead or stopping worker must not construct a tokenizer decode stream.
+        if cb.background_thread_status.can_accept_new_requests():
+            raise _cb_rejection_error(cb, request_id)
 
         input_ids = inputs["input_ids"]
-        request_id = cb.add_request(
-            input_ids,
-            request_id=request_id,
-            streaming=True,
-            max_new_tokens=gen_config.max_new_tokens,
-            eos_token_id=gen_config.eos_token_id,
-        )
+        loop = asyncio.get_running_loop()
+        text_queue: asyncio.Queue = asyncio.Queue()
         # ProcessorMixin exposes the fast tokenizer as .tokenizer; PreTrainedTokenizerFast is already one.
         rust_tokenizer = getattr(processor, "tokenizer", processor)._tokenizer  # type: ignore[union-attr]
         streamer = CBStreamer(
-            self._cb,
+            cb,
             request_id,
             rust_tokenizer,
             loop,
@@ -912,13 +918,12 @@ class CBGenerateManager(BaseGenerateManager):
         )
 
         # Register a direct callback: the dispatcher calls this on the event loop with each GenerationOutput.
-        # This decodes tokens and pushes text straight to the SSE text_queue
+        # This decodes tokens and pushes text straight to the SSE text_queue.
         def _on_output(output):
             try:
                 streamer.put(output)
-                # ``error`` is set together with ``status = FAILED`` in CB's _handle_request_error.
-                # Surface it as an end-of-stream error so the SSE handler can emit it and close,
-                # instead of leaving the client hanging on a stream that will never end.
+                # ``error`` is set with ``status = FAILED`` for generation failures and cancellations.
+                # Surface it so the SSE handler can emit it and close instead of hanging.
                 if output.error is not None:
                     text_queue.put_nowait(_StreamError(output.error))
                     streamer.end()
@@ -927,7 +932,23 @@ class CBGenerateManager(BaseGenerateManager):
             except Exception as e:
                 text_queue.put_nowait(_StreamError(str(e)))
 
+        # The handler has to exist before the request is queued. There is no await between these two calls, so the
+        # generation thread cannot deliver a terminal output into an empty handler slot.
         cb.register_result_handler(request_id, _on_output)
+        try:
+            submitted_id = cb.add_request(
+                input_ids,
+                request_id=request_id,
+                streaming=True,
+                max_new_tokens=gen_config.max_new_tokens,
+                eos_token_id=gen_config.eos_token_id,
+            )
+        except BaseException:
+            cb.output_router.discard_result_handler(request_id)
+            raise
+        if submitted_id is None:
+            cb.output_router.discard_result_handler(request_id)
+            raise _cb_rejection_error(cb, request_id)
         return text_queue, streamer
 
     async def generate_non_streaming(
@@ -957,14 +978,28 @@ class CBGenerateManager(BaseGenerateManager):
 
         cb.register_result_handler(request_id, _on_result)
 
-        cb.add_request(
-            input_ids,
-            request_id=request_id,
-            max_new_tokens=gen_config.max_new_tokens,
-            streaming=False,
-            eos_token_id=gen_config.eos_token_id,
-        )
-        result = await future
+        submitted_id: str | None = None
+        try:
+            submitted_id = cb.add_request(
+                input_ids,
+                request_id=request_id,
+                max_new_tokens=gen_config.max_new_tokens,
+                streaming=False,
+                eos_token_id=gen_config.eos_token_id,
+            )
+        except BaseException:
+            cb.output_router.discard_result_handler(request_id)
+            raise
+        if submitted_id is None:
+            cb.output_router.discard_result_handler(request_id)
+            raise _cb_rejection_error(cb, request_id)
+
+        try:
+            result = await future
+        except asyncio.CancelledError:
+            # The waiter is gone. Cancel the CB request so the loop emits one terminal output and drops the handler.
+            cb.cancel_request(submitted_id)
+            raise
         # CB signals a failed request by setting ``error`` (and ``status = FAILED``) on the
         # delivered GenerationOutput, often with empty ``generated_tokens``. Surface it instead
         # of returning an empty success that downstream parsing/decoding would silently mask.

@@ -18,10 +18,13 @@ Tests for the serving layer.
 
 import asyncio
 import json
+import queue
 import socket
+import threading
 import time
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from huggingface_hub.utils import httpx
 
@@ -35,6 +38,8 @@ from transformers.cli.serving.transcription import TranscriptionHandler
 from transformers.cli.serving.utils import (
     _RESPONSE_TEMPLATE_FALLBACKS,
     BaseHandler,
+    CBGenerateManager,
+    CBWorkerDeadError,
     GenerationState,
     Modality,
     ToolCall,
@@ -42,6 +47,15 @@ from transformers.cli.serving.utils import (
     parse_assistant_message,
     response_events_to_chunks,
 )
+from transformers.generation.continuous_batching.continuous_api import (
+    BackgroundThreadStatus,
+    ContinuousBatchingManager,
+    ContinuousBatchProcessor,
+    OutputRouter,
+)
+from transformers.generation.continuous_batching.distributed import DistributedHelper
+from transformers.generation.continuous_batching.requests import GenerationOutput, RequestStatus
+from transformers.generation.continuous_batching.scheduler import FIFOScheduler
 from transformers.testing_utils import (
     require_librosa,
     require_multipart,
@@ -1939,6 +1953,299 @@ class TestCBWorkerDeadServerIntegration(unittest.TestCase):
         self.assertIn("CUDA illegal memory access", resp.json()["error"])
 
 
+class TestCBNonStreamingCancellation(unittest.TestCase):
+    """Non-streaming continuous batching must cancel with the awaiting coroutine and fail a rejected submit."""
+
+    def _bare_cb(self, *, accepting: bool = True) -> ContinuousBatchingManager:
+        manager = ContinuousBatchingManager.__new__(ContinuousBatchingManager)
+        manager.is_tp_driver = True
+        manager.num_return_sequences = 1
+        manager.background_thread_status = BackgroundThreadStatus()
+        manager.output_router = OutputRouter()
+        manager.input_queue = queue.Queue()
+        manager.cancel_queue = queue.Queue()
+        manager._request_lock = threading.Lock()
+        manager._request_generation = {}
+        manager._wake_up_loop = threading.Event()
+        if not accepting:
+            manager.background_thread_status.request_stop(BackgroundThreadStatus.HARD_STOP, global_rank=0)
+        return manager
+
+    def _attach_model_free_processor(self, cb: ContinuousBatchingManager) -> ContinuousBatchProcessor:
+        """A processor that can admit and cancel, sharing this manager's queues, without a model."""
+        cache = MagicMock()
+        scheduler = FIFOScheduler(cache=cache, safety_margin=0.0, max_requests_per_batch=4)
+        scheduler.schedule_batch = lambda token_budget, cache_budget: ([], False, 0, 0)
+        processor = ContinuousBatchProcessor.__new__(ContinuousBatchProcessor)
+        processor.scheduler = scheduler
+        processor.cache = cache
+        processor.input_queue = cb.input_queue
+        processor.cancel_queue = cb.cancel_queue
+        processor.output_router = cb.output_router
+        processor.background_thread_status = cb.background_thread_status
+        processor.distributed_helper = DistributedHelper(device_mesh=None, cpu_group_timeout=None, tp_plan={})
+        processor.offloading_manager = SimpleNamespace(free_request_cpu_cache=lambda state: None)
+        processor.logit_processor = SimpleNamespace(check_kwargs=lambda kwargs: None)
+        processor.use_async_batching = False
+        processor._unsynced_forwards = 0
+        processor._deferred_block_frees = []
+        processor.max_batch_tokens = 8
+        processor.inputs_and_outputs = SimpleNamespace(
+            compute_stream=None, prepare_batch_update=lambda: ([], [], None)
+        )
+        cb.batch_processor = processor
+        return processor
+
+    def _manager(self, cb: ContinuousBatchingManager) -> tuple[CBGenerateManager, SimpleNamespace]:
+        manager = CBGenerateManager()
+        manager._cb = cb
+        gen_config = SimpleNamespace(max_new_tokens=4, eos_token_id=2)
+        return manager, gen_config
+
+    def test_rejected_submit_fails_and_drops_the_handler(self) -> None:
+        """`add_request` returning None raises immediately and does not leave the result handler behind."""
+        cb = self._bare_cb(accepting=False)
+        manager, gen_config = self._manager(cb)
+        request_id = "rejected"
+
+        async def _run() -> None:
+            with self.assertRaises(RuntimeError) as caught:
+                await asyncio.wait_for(
+                    manager.generate_non_streaming(
+                        MagicMock(), MagicMock(), {"input_ids": [1, 2, 3]}, gen_config, request_id
+                    ),
+                    timeout=2,
+                )
+            self.assertIn("rejected", str(caught.exception).lower())
+
+        asyncio.run(_run())
+        self.assertNotIn(request_id, cb.output_router.result_handlers)
+        self.assertTrue(cb.input_queue.empty())
+        self.assertTrue(cb.cancel_queue.empty())
+
+    def test_submit_error_drops_the_handler(self) -> None:
+        """An exception from `add_request` fails the call and drops the handler registered just before it."""
+        cb = self._bare_cb()
+        cb.input_queue = MagicMock()
+        cb.input_queue.put.side_effect = queue.Full
+        manager, gen_config = self._manager(cb)
+
+        async def _run() -> None:
+            with self.assertRaises(queue.Full):
+                await asyncio.wait_for(
+                    manager.generate_non_streaming(
+                        MagicMock(), MagicMock(), {"input_ids": [1, 2, 3]}, gen_config, "full"
+                    ),
+                    timeout=2,
+                )
+
+        asyncio.run(_run())
+        self.assertNotIn("full", cb.output_router.result_handlers)
+        self.assertTrue(cb.cancel_queue.empty())
+
+    def test_cancelling_the_waiter_cancels_the_request(self) -> None:
+        """Cancelling the coroutine that is waiting for tokens cancels the underlying CB request."""
+        cb = self._bare_cb()
+        manager, gen_config = self._manager(cb)
+        decoder = MagicMock()
+        batch_processor = self._attach_model_free_processor(cb)
+        request_id = "cancel-me"
+
+        async def _run() -> None:
+            task = asyncio.create_task(
+                manager.generate_non_streaming(MagicMock(), decoder, {"input_ids": [1, 2, 3]}, gen_config, request_id)
+            )
+            for _ in range(50):
+                if request_id in cb.output_router.result_handlers and not cb.input_queue.empty():
+                    break
+                await asyncio.sleep(0)
+            self.assertIn(request_id, cb.output_router.result_handlers)
+            state = cb.input_queue.get_nowait()
+            cb.input_queue.put(state)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            # The handler stays until the terminal output arrives. Dropping it here would hide that output.
+            self.assertIn(request_id, cb.output_router.result_handlers)
+            self.assertFalse(batch_processor.prepare_next_batch())
+            for _ in range(20):
+                if request_id not in cb.output_router.result_handlers:
+                    break
+                await asyncio.sleep(0)
+
+            self.assertEqual(state.status, RequestStatus.FAILED)
+            self.assertIn("cancelled", state.error)
+            self.assertNotIn(request_id, cb.output_router.result_handlers)
+            self.assertTrue(cb.cancel_queue.empty())
+            self.assertTrue(cb.input_queue.empty())
+            self.assertTrue(cb.output_router.output_queue.empty())
+
+        asyncio.run(_run())
+        decoder.decode.assert_not_called()
+
+    def test_cancellation_output_is_not_returned_as_success(self) -> None:
+        """A terminal FAILED cancellation is raised to the caller and the handler is removed."""
+        cb = self._bare_cb()
+        manager, gen_config = self._manager(cb)
+        request_id = "failed-cancel"
+
+        async def _run() -> None:
+            task = asyncio.create_task(
+                manager.generate_non_streaming(
+                    MagicMock(), MagicMock(), {"input_ids": [1, 2, 3]}, gen_config, request_id
+                )
+            )
+            for _ in range(50):
+                if request_id in cb.output_router.result_handlers:
+                    break
+                await asyncio.sleep(0)
+            callback, _loop = cb.output_router.result_handlers[request_id]
+            bound = cb.output_router.handler_generations[request_id]
+            callback(
+                GenerationOutput(
+                    request_id=request_id,
+                    generated_tokens=[9],
+                    status=RequestStatus.FAILED,
+                    error=f"Request {request_id} was cancelled.",
+                    generation=0 if bound is None else bound,
+                )
+            )
+            with self.assertRaises(RuntimeError) as caught:
+                await task
+            self.assertIn("cancelled", str(caught.exception))
+            self.assertNotIn("success", str(caught.exception).lower())
+
+        asyncio.run(_run())
+        self.assertNotIn(request_id, cb.output_router.result_handlers)
+
+    def test_success_still_returns_text_and_drops_the_handler(self) -> None:
+        """A finished generation still resolves the waiter and removes the handler."""
+        cb = self._bare_cb()
+        manager, gen_config = self._manager(cb)
+        processor = MagicMock()
+        processor.decode.return_value = "hello"
+        request_id = "ok"
+
+        async def _run() -> None:
+            task = asyncio.create_task(
+                manager.generate_non_streaming(
+                    MagicMock(), processor, {"input_ids": [1, 2, 3]}, gen_config, request_id
+                )
+            )
+            for _ in range(50):
+                if request_id in cb.output_router.result_handlers:
+                    break
+                await asyncio.sleep(0)
+            callback, _loop = cb.output_router.result_handlers[request_id]
+            bound = cb.output_router.handler_generations[request_id]
+            callback(
+                GenerationOutput(
+                    request_id=request_id,
+                    generated_tokens=[8, 9],
+                    status=RequestStatus.FINISHED,
+                    generation=0 if bound is None else bound,
+                )
+            )
+            text, input_len, generated_ids = await task
+            self.assertEqual(text, "hello")
+            self.assertEqual(input_len, 3)
+            self.assertEqual(list(generated_ids), [8, 9])
+
+        asyncio.run(_run())
+        self.assertNotIn(request_id, cb.output_router.result_handlers)
+        processor.decode.assert_called_once()
+
+    def test_streaming_rejected_submit_does_not_register_a_handler(self) -> None:
+        """A rejected streaming submit raises before a handler or streamer is created."""
+        cb = self._bare_cb(accepting=False)
+        manager, gen_config = self._manager(cb)
+        with self.assertRaises(RuntimeError) as caught:
+            manager.generate_streaming(MagicMock(), MagicMock(), {"input_ids": [1, 2, 3]}, gen_config, "stream-reject")
+        self.assertIn("rejected", str(caught.exception).lower())
+        self.assertEqual(cb.output_router.result_handlers, {})
+        self.assertTrue(cb.cancel_queue.empty())
+
+    def test_streaming_registers_the_handler_before_add_request(self) -> None:
+        """The SSE handler exists at the moment `add_request` is entered, so an early terminal output is not lost."""
+        cb = self._bare_cb()
+        manager, gen_config = self._manager(cb)
+        request_id = "stream-ok"
+        seen: dict[str, bool] = {}
+
+        def _spy(input_ids, request_id=None, **kwargs):
+            seen["registered"] = request_id in cb.output_router.result_handlers
+            return request_id
+
+        cb.add_request = _spy  # type: ignore[method-assign]
+
+        async def _run() -> None:
+            with patch("transformers.cli.serving.utils.CBStreamer", return_value=MagicMock()):
+                text_queue, _streamer = manager.generate_streaming(
+                    MagicMock(), MagicMock(), {"input_ids": [1, 2, 3]}, gen_config, request_id
+                )
+            self.assertIsNotNone(text_queue)
+
+        asyncio.run(_run())
+        self.assertTrue(seen["registered"])
+        self.assertIn(request_id, cb.output_router.result_handlers)
+
+    def test_streaming_submit_error_drops_the_handler(self) -> None:
+        """A streaming `add_request` that raises or returns None removes the handler it just registered."""
+        cb = self._bare_cb()
+        manager, gen_config = self._manager(cb)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("submit failed")
+
+        cb.add_request = _boom  # type: ignore[method-assign]
+
+        async def _raise() -> None:
+            with patch("transformers.cli.serving.utils.CBStreamer", return_value=MagicMock()):
+                with self.assertRaises(RuntimeError):
+                    manager.generate_streaming(
+                        MagicMock(), MagicMock(), {"input_ids": [1, 2, 3]}, gen_config, "stream-err"
+                    )
+
+        asyncio.run(_raise())
+        self.assertNotIn("stream-err", cb.output_router.result_handlers)
+
+        cb.add_request = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+        async def _reject() -> None:
+            with patch("transformers.cli.serving.utils.CBStreamer", return_value=MagicMock()):
+                with self.assertRaises(RuntimeError) as caught:
+                    manager.generate_streaming(
+                        MagicMock(), MagicMock(), {"input_ids": [1, 2, 3]}, gen_config, "stream-none"
+                    )
+            self.assertIn("rejected", str(caught.exception).lower())
+
+        asyncio.run(_reject())
+        self.assertNotIn("stream-none", cb.output_router.result_handlers)
+        self.assertTrue(cb.cancel_queue.empty())
+
+    def test_worker_death_during_submit_drops_the_handler(self) -> None:
+        """If the worker dies between the liveness check and `add_request`, the submit fails and the handler is dropped."""
+        cb = self._bare_cb()
+        manager, gen_config = self._manager(cb)
+        request_id = "died"
+
+        def _die(*args, **kwargs):
+            cb.background_thread_status.fatal_error = RuntimeError("CUDA illegal memory access")
+            return None
+
+        cb.add_request = _die  # type: ignore[method-assign]
+
+        async def _run() -> None:
+            with self.assertRaises(CBWorkerDeadError) as caught:
+                await manager.generate_non_streaming(
+                    MagicMock(), MagicMock(), {"input_ids": [1, 2, 3]}, gen_config, request_id
+                )
+            self.assertIn("CUDA illegal memory access", str(caught.exception))
+
+        asyncio.run(_run())
+        self.assertNotIn(request_id, cb.output_router.result_handlers)
+
+
 class _TestToolCallBase:
     """Base class for tool call integration tests. Subclasses set MODEL and inherit all tests."""
 
@@ -2725,7 +3032,7 @@ class TestContinuousBatchingChatCompletion(ServeIntegrationTestCase):
 
         self.assertTrue(
             scheduler.request_is_cancelled(request_id),
-            f"Request {request_id} not cancelled in scheduler after stream close.",
+            f"Request {request_id} was not cancelled; absence from the scheduler is not cancellation.",
         )
 
         # Server should still be healthy and serve subsequent requests
@@ -2830,7 +3137,7 @@ class TestContinuousBatchingResponses(ServeIntegrationTestCase):
 
         self.assertTrue(
             scheduler.request_is_cancelled(request_id),
-            f"Request {request_id} not cancelled in scheduler after stream close.",
+            f"Request {request_id} was not cancelled; absence from the scheduler is not cancellation.",
         )
 
         # Server should still serve subsequent requests
