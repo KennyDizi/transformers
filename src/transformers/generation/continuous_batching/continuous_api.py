@@ -95,12 +95,35 @@ class OutputRouter:
     def __init__(self) -> None:
         self.output_queue = queue.Queue()
         self.result_handlers: dict[str, tuple[Callable, asyncio.AbstractEventLoop]] = {}
+        # None means the handler is not bound to a submission yet and accepts whatever arrives. A bound generation
+        # rejects outputs from an older submission of the same id.
+        self.handler_generations: dict[str, int | None] = {}
         self._lock = threading.Lock()
+
+    def discard_result_handler(self, request_id: str) -> None:
+        """Drop a registered handler without delivering a result.
+
+        Used when a request is rejected before the generation loop can produce an output. Leaving the handler in place
+        would keep the caller blocked on a result that will never arrive.
+        """
+        with self._lock:
+            self.result_handlers.pop(request_id, None)
+            self.handler_generations.pop(request_id, None)
+
+    def _handler_entry(self, output: GenerationOutput) -> tuple[Callable, asyncio.AbstractEventLoop] | None:
+        """Return the handler for this output, or None when it belongs to a different submission."""
+        entry = self.result_handlers.get(output.request_id)
+        if entry is None:
+            return None
+        bound = self.handler_generations.get(output.request_id)
+        if bound is not None and output.generation != bound:
+            return None
+        return entry
 
     def deliver(self, output: GenerationOutput) -> None:
         """Route a single output to its registered handler or the output_queue."""
         with self._lock:
-            entry = self.result_handlers.get(output.request_id)
+            entry = self._handler_entry(output)
         if entry is not None:
             callback, loop = entry
             loop.call_soon_threadsafe(callback, output)
@@ -116,7 +139,7 @@ class OutputRouter:
         loop = None
         with self._lock:
             for output in outputs:
-                entry = self.result_handlers.get(output.request_id)
+                entry = self._handler_entry(output)
                 if entry is not None:
                     callback, loop = entry
                     callbacks.append((callback, output))
@@ -324,7 +347,7 @@ class ContinuousBatchProcessor:
             continuous_batching_config: The continuous batching configuration
             logit_processor: The [`ContinuousBatchingLogitsProcessorList`] object used to process the logits.
             input_queue: Queue for incoming requests. Is None if this process is not a TP driver.
-            cancel_queue: Queue for cancellation request_ids. Is None if this process is not a TP driver.
+            cancel_queue: Queue of `(request_id, generation)` cancellations. Is None if this process is not a TP driver.
             output_router: An [`OutputRouter`] object that routes outputs to handlers or the output queue.
             background_thread_status: A [`BackgroundThreadStatus`] object to track the background thread status.
             model_device: Device for model inputs/outputs
@@ -367,6 +390,10 @@ class ContinuousBatchProcessor:
             "logit_processor": self.logit_processor,
         }
         self.use_async_batching = self.cb_config.use_async_batching
+        # Async forwards overlap the host. Blocks of a cancelled request stay allocated until each forward that may
+        # still write them has been synchronized. Each entry is (request_id, syncs still to wait for).
+        self._unsynced_forwards = 0
+        self._deferred_block_frees: list[tuple[str, int]] = []
 
         if self.use_async_batching:
             self.inputs_and_outputs = ContinuousBatchingAsyncIOs(**io_kwargs)
@@ -408,10 +435,154 @@ class ContinuousBatchProcessor:
 
     def reset(self) -> None:
         """Reset the batch processor for a new generation loop."""
+        self._unsynced_forwards = 0
+        self._deferred_block_frees = []
         self.offloading_manager.reset()
         self.scheduler.reset()
         self.inputs_and_outputs.reset()
         self.cache.free_all_requests()
+
+    @staticmethod
+    def _coerce_cancellation(item: str | tuple[str, int]) -> tuple[str, int]:
+        """Accept a bare id, from an older queue item, as generation 0."""
+        if isinstance(item, str):
+            return item, 0
+        request_id, generation = item
+        return request_id, generation
+
+    def _cancellation_error(self, request_id: str) -> RuntimeError:
+        return RuntimeError(f"Request {request_id} was cancelled.")
+
+    def _stopped_request_error(self) -> RuntimeError:
+        # Same text as the loop epilogue, so a hard-stopped queued request matches `fail_all_requests`.
+        return RuntimeError(
+            f"Generation loop finished before this request completed w/ {self.background_thread_status.tp_status = }"
+        )
+
+    def _fail_if_open(self, state: RequestState, error: Exception) -> None:
+        if state.status < RequestStatus.FINISHED:
+            self.output_router.fail_and_deliver(state, error)
+
+    def _release_cancelled_blocks(self, request_id: str) -> None:
+        """Free KV blocks, unless an async forward may still be writing them."""
+        if self.use_async_batching and self._unsynced_forwards > 0:
+            self._deferred_block_frees.append((request_id, self._unsynced_forwards))
+        else:
+            self.cache.free_blocks(request_id)
+
+    def _note_async_forward_synced(self) -> None:
+        """One async forward has been synchronized. Retire blocks that were waiting on it."""
+        if not self.use_async_batching:
+            return
+        if self._unsynced_forwards > 0:
+            self._unsynced_forwards -= 1
+        still_waiting: list[tuple[str, int]] = []
+        for request_id, waits in self._deferred_block_frees:
+            remaining = waits - 1
+            if remaining <= 0:
+                self.cache.free_blocks(request_id)
+            else:
+                still_waiting.append((request_id, remaining))
+        self._deferred_block_frees = still_waiting
+
+    def _finish_cancellations(self) -> None:
+        """Pop cancelled states and deliver one failure each. KV frees may wait out an async forward."""
+        cancelled: list[RequestState] = []
+        for state in self.scheduler.clear_cancelled_requests():
+            if all(state is not seen for seen in cancelled):
+                cancelled.append(state)
+        for state in cancelled:
+            self.offloading_manager.free_request_cpu_cache(state)
+            self._release_cancelled_blocks(state.request_id)
+            self._fail_if_open(state, self._cancellation_error(state.request_id))
+
+    def _retire_replaced_request(self, state: RequestState) -> None:
+        self.scheduler._requests_to_fork = [fork for fork in self.scheduler._requests_to_fork if fork is not state]
+        self.offloading_manager.free_request_cpu_cache(state)
+        self._release_cancelled_blocks(state.request_id)
+        self._fail_if_open(state, RuntimeError(f"Request {state.request_id} was replaced by a newer submission."))
+
+    def _displace_older_generation(self, incoming: RequestState) -> bool:
+        """Drop older states with this id. Return False when `incoming` must not be admitted."""
+        request_id = incoming.request_id
+        currents: list[RequestState] = []
+        for mapping in (self.scheduler.active_requests, self.scheduler.waiting_requests):
+            state = mapping.get(request_id)
+            if state is not None and all(state is not seen for seen in currents):
+                currents.append(state)
+        if not currents:
+            return True
+        if any(state.generation >= incoming.generation for state in currents):
+            if any(state.generation > incoming.generation for state in currents):
+                message = (
+                    f"Request {request_id} was not admitted because a newer request with this id is already queued."
+                )
+            else:
+                message = f"Request {request_id} is already queued."
+            self._fail_if_open(incoming, RuntimeError(message))
+            return False
+        for mapping in (self.scheduler.active_requests, self.scheduler.waiting_requests):
+            mapping.pop(request_id, None)
+        order = self.scheduler.waiting_requests_order
+        while request_id in order:
+            order.remove(request_id)
+        for state in currents:
+            self._retire_replaced_request(state)
+        if not self.scheduler.active_requests:
+            self.scheduler.block_new_requests = False
+        return True
+
+    def _admit_requests(self, new_states: list[RequestState]) -> None:
+        for state in new_states:
+            try:
+                self.logit_processor.check_kwargs(state.logit_processor_kwargs)
+            except Exception as e:
+                logger.error(f"Error processing new request: {e}", exc_info=True)
+                self._handle_request_error(e, state)
+                continue
+            if not self._displace_older_generation(state):
+                continue
+            self.scheduler.add_waiting_request(state)
+
+    def _mark_cancellations(self, cancellations: list[Any]) -> None:
+        for item in cancellations:
+            request_id, generation = self._coerce_cancellation(item)
+            self.scheduler.set_request_cancellation(request_id, generation)
+
+    def _fail_hard_stop_payload(self, new_states: list[RequestState], cancellations: list[Any]) -> None:
+        """Fail requests that existed only in the drained input queue, then record their cancellations."""
+        cancelled_generation: dict[str, int] = {}
+        for item in cancellations:
+            request_id, generation = self._coerce_cancellation(item)
+            current = cancelled_generation.get(request_id)
+            if current is None or generation > current:
+                cancelled_generation[request_id] = generation
+            self.scheduler.set_request_cancellation(request_id, generation)
+        stop_error = self._stopped_request_error()
+        for state in new_states:
+            generation = cancelled_generation.get(state.request_id)
+            if generation is not None and state.generation <= generation:
+                self._fail_if_open(state, self._cancellation_error(state.request_id))
+            else:
+                self._fail_if_open(state, stop_error)
+
+    def _ingest_inflight_cancellations(self) -> None:
+        """Apply cancellations queued during the forward, before this batch's tokens are published.
+
+        The input queue stays put for the next prepare. An empty cancel set does not clear
+        `block_new_requests`; the next prepare does that when nothing is active.
+        """
+        cancels: list[Any] = drain_queue(self.cancel_queue) if self.cancel_queue is not None else []
+        payload_size, _tp_status, _pause_requested = self.distributed_helper.tp_all_reduce_state(
+            payload_size=len(cancels),
+            stop_status=0,
+            pause_requested=0,
+        )
+        if payload_size == 0:
+            return
+        cancels = self.distributed_helper.tp_broadcast_object_from_rank_0(cancels)
+        self._mark_cancellations(cancels)
+        self._finish_cancellations()
 
     def _update_tp_group_state(self) -> bool:
         """Communicates with the TP group to get A. the new requests and cancellations from the TP driver, and B. an
@@ -432,8 +603,12 @@ class ContinuousBatchProcessor:
 
         # Update the local stop status with the new one
         self.background_thread_status.update_with_tp_status(tp_status)
-        # Exit early if the TP group is hard-stopping
+        # A hard stop still shares the drained payload. Every rank must broadcast when the reduced size is non-zero,
+        # or the non-drivers block in the collective. Queued requests are failed here instead of being discarded.
         if self.background_thread_status.tp_status == BackgroundThreadStatus.HARD_STOP:
+            if payload_size > 0:
+                new_states, cancellations = self.distributed_helper.tp_broadcast_object_from_rank_0(payload)
+                self._fail_hard_stop_payload(new_states, cancellations)
             return True
 
         # Pause window: if any thread of the TP group asked for a pause, all ranks wait here until their own threads
@@ -454,19 +629,11 @@ class ContinuousBatchProcessor:
         # After the pause window is done, we can still exit early if there is no payload
         if payload_size == 0:
             return False
-        # Otherwise, distribute the payload of TP rank 0 to all other TP ranks
+        # Otherwise, distribute the payload of TP rank 0 to all other TP ranks.
+        # Admits run before cancellations, so a queued cancel still hits the request admitted in this payload.
         new_states, cancellations = self.distributed_helper.tp_broadcast_object_from_rank_0(payload)
-
-        # All ranks apply the same updates in the same order.
-        for state in new_states:
-            try:
-                self.logit_processor.check_kwargs(state.logit_processor_kwargs)
-                self.scheduler.add_waiting_request(state)
-            except Exception as e:
-                logger.error(f"Error processing new request: {e}", exc_info=True)
-                self._handle_request_error(e, state)
-        for request_id in cancellations:
-            self.scheduler.set_request_cancellation(request_id)
+        self._admit_requests(new_states)
+        self._mark_cancellations(cancellations)
         return False
 
     def _handle_request_error(self, error: Exception, state: RequestState) -> None:
@@ -483,16 +650,11 @@ class ContinuousBatchProcessor:
         """Prepare tensors and metadata for the next model forward pass. Returns True if there are requests to process,
         False otherwise."""
 
-        # Communicate with the TP driver to retrieve new requests, cancellations and an eventual stop signal
+        # Retire cancellations even when the group is hard-stopping, so the in-flight update cannot publish them
+        # as a successful finish. Hard stop does not schedule another batch.
         hard_stopping = self._update_tp_group_state()
-        if hard_stopping:
-            return False
-
-        cancelled_states = self.scheduler.clear_cancelled_requests()
-        # Also free CPU-offloaded cache for cancelled states. This is CPU-only, so it isn't batched like D2H transfers
-        for state in cancelled_states:
-            self.offloading_manager.free_request_cpu_cache(state)
-        if not self.scheduler.has_pending_requests():
+        self._finish_cancellations()
+        if hard_stopping or not self.scheduler.has_pending_requests():
             return False
 
         # Schedule the next batch of requests
@@ -537,15 +699,21 @@ class ContinuousBatchProcessor:
 
     def update_batch(self) -> None:
         """Update request states based on generated tokens."""
+        # Cancellations that arrived during the forward must land before this batch's token is published.
+        self._ingest_inflight_cancellations()
         requests_in_batch, new_tokens, logprobs = self.inputs_and_outputs.prepare_batch_update()
+        # The sync above retired one async forward. Free KV blocks that were waiting on it.
+        self._note_async_forward_synced()
         current_logits_index = 0
         pending_outputs = []
         for future_state in requests_in_batch:
             state = future_state.state
-            # Early return if the request was finished or offloaded between scheduling and update (async mode)
-            if state.status in (RequestStatus.FINISHED, RequestStatus.PENDING):
-                if self.use_async_batching:
-                    # Skip this request, but still consume its token from new_tokens if it had one
+            # An async update applies the previous batch, which may contain a request that has since finished, failed,
+            # been cancelled, or been offloaded. Drop that token. FAILED (cancellation or a real failure) is also
+            # dropped in sync mode so a cancellation cannot resurrect the request. FINISHED/PENDING in sync mode is
+            # still a programming error: those transitions cannot happen between schedule and update on one thread.
+            if state.status >= RequestStatus.FINISHED or state.status == RequestStatus.PENDING:
+                if self.use_async_batching or state.status >= RequestStatus.FAILED:
                     if future_state.has_new_token:
                         current_logits_index += 1
                     continue
@@ -597,6 +765,8 @@ class ContinuousBatchProcessor:
                 for new_request_id in new_request_ids[len(forked_ids) :]:
                     child_state = state_to_fork.create_equivalent_initial_request()
                     child_state.request_id = new_request_id
+                    # The copy keeps the parent's generation. This id was never submitted, so cancel sees generation 0.
+                    child_state.generation = 0
                     self.scheduler.add_waiting_request(child_state)
 
             # Actually perform the block copies
@@ -611,14 +781,22 @@ class ContinuousBatchProcessor:
         """Handle errors during batch processing."""
         failed_future_states = self.inputs_and_outputs.prepare_batch_update()[0]
         for future_state in failed_future_states:
-            self._handle_request_error(error, future_state.state)
-            self.scheduler.finish_request(future_state.state.request_id)
+            state = future_state.state
+            # A finished or cancelled request already has its one terminal output.
+            if state.status >= RequestStatus.FINISHED:
+                continue
+            self._handle_request_error(error, state)
+            self.scheduler.finish_request(state.request_id)
 
     def fail_all_requests(self, error: Exception) -> None:
         """Fail all active requests with the given error."""
 
         requests = list(self.scheduler.active_requests.values())
         for state in requests:
+            # Cancellation already published the one terminal output. Pop without freeing blocks a second time.
+            if state.status >= RequestStatus.FINISHED:
+                self.scheduler.active_requests.pop(state.request_id, None)
+                continue
             self._handle_request_error(error, state)
             self.scheduler.finish_request(state.request_id)
 
@@ -626,6 +804,8 @@ class ContinuousBatchProcessor:
         self.offloading_manager.free_all_waiting_cpu_caches()
         for req_id in list(self.scheduler.waiting_requests.keys()):
             state = self.scheduler.waiting_requests.pop(req_id)
+            if state.status >= RequestStatus.FINISHED:
+                continue
             self._handle_request_error(error, state)
 
         # Clear the ordering queue
@@ -645,6 +825,8 @@ class ContinuousBatchProcessor:
         # This initiates the transfer of the outputs to the host. It is blocking in sync mode and non-blocking in async
         # mode.
         self.inputs_and_outputs.retrieve_device_outputs()
+        if self.use_async_batching:
+            self._unsynced_forwards += 1
 
     @torch.no_grad()
     def warmup(self, model: nn.Module) -> None:
@@ -681,8 +863,9 @@ class ContinuousBatchingManager:
         """
         # Accumulators for request handling
         self.input_queue = queue.Queue(maxsize=continuous_batching_config.max_queue_size)
-        self.cancel_queue: queue.Queue[str] = queue.Queue()
+        self.cancel_queue: queue.Queue[tuple[str, int]] = queue.Queue()
         self._request_counter = 0
+        self._request_generation: dict[str, int] = {}
         self._request_lock = threading.Lock()
         self._wake_up_loop = threading.Event()
 
@@ -954,6 +1137,12 @@ class ContinuousBatchingManager:
             streaming=streaming,
             logit_processor_kwargs=logit_processor_kwargs,
         )
+        with self._request_lock:
+            generation = self._request_generation.get(request_id, 0) + 1
+            self._request_generation[request_id] = generation
+        state.generation = generation
+        # Bind before the queue put so a fast completion cannot deliver against an unbound handler.
+        self._bind_result_handler(request_id, generation)
 
         # Use block=True with timeout to handle backpressure if queue is full
         self.input_queue.put(state, block=True, timeout=10)
@@ -996,11 +1185,33 @@ class ContinuousBatchingManager:
         return request_ids
 
     def cancel_request(self, request_id: str) -> None:
-        """Cancel a request by its ID. If this called from a process that is not a TP driver, it's a no-op: only TP
-        driver processes interact with the manager."""
-        if self.is_tp_driver:
-            self.cancel_queue.put(request_id)
-            self._wake_up_loop.set()
+        """Cancel a request by its ID.
+
+        The cancellation names the generation that existed when it was issued, so a newer submission of the same id
+        keeps running. The generation thread applies it on its next prepare, and again before an in-flight batch
+        publishes its token. If that generation is still waiting or active, it is removed and exactly one terminal
+        output is delivered: ``status`` is ``FAILED``, ``error`` says the request was cancelled, and ``is_finished()``
+        is true. That unblocks ``request_id_iter`` and removes a handler registered with ``register_result_handler``.
+        An already finished or unknown id delivers nothing. The in-flight token is not applied, the request is not put
+        back, and its children are not created.
+
+        If this is called from a process that is not a TP driver, it's a no-op: only TP driver processes interact with
+        the manager.
+        """
+        if not self.is_tp_driver:
+            return
+        with self._request_lock:
+            generation = self._request_generation.get(request_id, 0)
+        self.cancel_queue.put((request_id, generation))
+        self._wake_up_loop.set()
+
+    def _bind_result_handler(self, request_id: str, generation: int) -> None:
+        """Attach this submission to a handler that was registered before the request was queued."""
+        with self.output_router._lock:
+            if request_id not in self.output_router.result_handlers:
+                return
+            if self.output_router.handler_generations.get(request_id) is None:
+                self.output_router.handler_generations[request_id] = generation
 
     # TODO (remi-or) : handle benchmarking properly when updating / fixing the requeue logic
     # TODO (remi-or) : this NEEDS to get fixed in a future PR -- it's quite wasteful
@@ -1055,13 +1266,27 @@ class ContinuousBatchingManager:
         loop = asyncio.get_running_loop()
 
         def _auto_cleanup(result):
+            with self.output_router._lock:
+                bound = self.output_router.handler_generations.get(request_id)
+            # A queued callback from an older submission must not run, and must not drop the handler that replaced it.
+            if bound is not None and result.generation != bound:
+                return
             callback(result)
-            if result.is_finished():
-                with self.output_router._lock:
-                    self.output_router.result_handlers.pop(request_id, None)
+            if not result.is_finished():
+                return
+            with self.output_router._lock:
+                current = self.output_router.result_handlers.get(request_id)
+                if current is None or current[0] is not _auto_cleanup:
+                    return
+                self.output_router.result_handlers.pop(request_id, None)
+                self.output_router.handler_generations.pop(request_id, None)
+            with self._request_lock:
+                if self._request_generation.get(request_id) == result.generation:
+                    self._request_generation.pop(request_id, None)
 
         with self.output_router._lock:
             self.output_router.result_handlers[request_id] = (_auto_cleanup, loop)
+            self.output_router.handler_generations[request_id] = None
 
     # ---------------------------------------- BACKGROUND THREAD ONLY METHODS ---------------------------------------- #
 

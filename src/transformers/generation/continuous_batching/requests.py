@@ -81,7 +81,11 @@ def get_device_and_memory_breakdown() -> tuple[torch.device, int, int, int]:
 
 
 class RequestStatus(IntEnum):
-    """Status of a generation request through its lifecycle."""
+    """Status of a generation request through its lifecycle.
+
+    ``FAILED`` is terminal and is also used when a request is cancelled. ``GenerationOutput.is_finished()`` is true for
+    every status greater than or equal to ``FINISHED``.
+    """
 
     PENDING = 0
     PREFILLING = 1
@@ -103,6 +107,7 @@ class GenerationOutput:
         status (RequestStatus): The status of the request.
         created_time (float): The time the request was created.
         lifespan (tuple[float, float]): The time the request was no longer pending and the time the request finished.
+        generation (int): Submission generation. A cancellation records the generation it observed.
     """
 
     request_id: str
@@ -114,9 +119,10 @@ class GenerationOutput:
     created_time: float = field(default_factory=time.perf_counter)
     lifespan: tuple[float, float] = (-1, -1)  # (time request was no longer pending, time request finished)
     timestamps: list[float] | None = None  # Timestamps of the generated tokens
+    generation: int = 0
 
     def is_finished(self) -> bool:
-        """Whether the request reached a terminal state, either because it finished generating or because it failed."""
+        """Whether the request reached a terminal state: it finished generating, failed, or was cancelled."""
         return self.status >= RequestStatus.FINISHED
 
 
@@ -180,6 +186,7 @@ class RequestState:
     _new_tokens_limit: int = 2147483647  # An int to check the max number of new tokens w/out always comparing w/ None
     remaining_prefill_tokens: list[int] = field(default_factory=list)  # Initial tokens left to process
     is_cpu_offloaded: bool = False  # True when the request's KV cache is in the CPU swap pool
+    generation: int = 0  # Bumped on every submission of this id. Cancellations name the generation they observed.
 
     def __post_init__(self):
         # If no max length is set, we set an absurdly high value which will never be reached
@@ -301,6 +308,7 @@ class RequestState:
             created_time=self.created_time,
             lifespan=self.lifespan,
             timestamps=self.timestamps[:] if self.timestamps is not None else None,
+            generation=self.generation,
         )
 
     def fork(self, new_request_id: str) -> "RequestState":
@@ -313,6 +321,8 @@ class RequestState:
         new_request._timestamps = []
         # Update fields overwritten in __post_init__
         new_request.remaining_prefill_tokens = self.remaining_prefill_tokens[:]
+        # A child is a new id. cancel_request records generation 0 until that id is published.
+        new_request.generation = 0
         return new_request
 
     def get_request_config(self) -> dict:
@@ -349,6 +359,8 @@ class RequestState:
         # Otherwise, we set the true initial tokens to the number of initial tokens
         else:
             new_state._true_initial_tokens = len(self.initial_tokens)
+        # Soft reset keeps the id, so a cancellation of this submission still matches.
+        new_state.generation = self.generation
         return new_state
 
 

@@ -12,18 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import copy
 import functools
 import gc
 import itertools
 import math
 import os
+import queue
 import threading
 import time
 import unittest
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 from parameterized import parameterized
@@ -53,17 +55,20 @@ from transformers.generation.continuous_batching.cache_allocators import (
 from transformers.generation.continuous_batching.continuous_api import (
     BackgroundThreadStatus,
     ContinuousBatchingManager,
+    ContinuousBatchProcessor,
     OutputRouter,
 )
 from transformers.generation.continuous_batching.distributed import DistributedHelper
 from transformers.generation.continuous_batching.input_outputs import build_attention_mask
 from transformers.generation.continuous_batching.offloading_manager import OffloadingManager
 from transformers.generation.continuous_batching.requests import (
+    FutureRequestState,
     GenerationOutput,
     RequestState,
     RequestStatus,
     get_device_and_memory_breakdown,
 )
+from transformers.generation.continuous_batching.scheduler import _APPLIED_CANCELLATION_LIMIT, FIFOScheduler
 from transformers.generation.continuous_batching.utils import DEVICE_TYPE_TO_GRAPH_NAME
 from transformers.integrations.eager_paged import eager_paged_attention_forward
 from transformers.testing_utils import (
@@ -1205,6 +1210,653 @@ class ContinuousBatchingPauseTest(unittest.TestCase):
         finished, error = self._pause_in_thread(manager)
         self.assertTrue(finished, "pause blocked on an already stopped manager")
         self.assertIsInstance(error, RuntimeError)
+
+
+def _cb_request(
+    request_id: str,
+    status: RequestStatus = RequestStatus.DECODING,
+    generated: list[int] | None = None,
+    streaming: bool = False,
+    max_new_tokens: int = 8,
+    num_children: int = 0,
+) -> RequestState:
+    """A request state placed directly into a model-free scheduler."""
+    state = RequestState(
+        request_id=request_id,
+        initial_tokens=[1, 2, 3],
+        max_new_tokens=max_new_tokens,
+        streaming=streaming,
+        num_children=num_children,
+    )
+    state._status = status
+    if generated:
+        state.generated_tokens = list(generated)
+    return state
+
+
+def _build_model_free_manager():
+    """Build a manager whose generation loop can admit and cancel requests without a model.
+
+    The scheduler cache is a mock, and `schedule_batch` reports that nothing fits so the loop can idle without
+    allocating KV blocks. Tests that still have a live request after a cancellation keep that stub, or replace it.
+    """
+    manager = ContinuousBatchingManager.__new__(ContinuousBatchingManager)
+    manager.is_tp_driver = True
+    manager._wake_up_loop = threading.Event()
+    manager.background_thread_status = BackgroundThreadStatus()
+    manager.output_router = OutputRouter()
+    manager.input_queue = queue.Queue()
+    manager.cancel_queue = queue.Queue()
+    manager._request_lock = threading.Lock()
+    manager._request_generation = {}
+    manager._generation_thread = None
+    manager.batch_processor = None
+
+    cache = MagicMock()
+    scheduler = FIFOScheduler(cache=cache, safety_margin=0.0, max_requests_per_batch=4)
+    # Real scheduling needs a cache. An empty batch keeps the loop waiting for the next cancellation.
+    scheduler.schedule_batch = lambda token_budget, cache_budget: ([], False, 0, 0)
+    processor = ContinuousBatchProcessor.__new__(ContinuousBatchProcessor)
+    processor.scheduler = scheduler
+    processor.cache = cache
+    processor.input_queue = manager.input_queue
+    processor.cancel_queue = manager.cancel_queue
+    processor.output_router = manager.output_router
+    processor.background_thread_status = manager.background_thread_status
+    processor.distributed_helper = DistributedHelper(device_mesh=None, cpu_group_timeout=None, tp_plan={})
+    processor.offloading_manager = SimpleNamespace(
+        free_request_cpu_cache=lambda state: None,
+        free_all_waiting_cpu_caches=lambda: None,
+    )
+    processor.logit_processor = SimpleNamespace(check_kwargs=lambda kwargs: None)
+    processor.use_async_batching = False
+    processor._unsynced_forwards = 0
+    processor._deferred_block_frees = []
+    processor.max_batch_tokens = 8
+    processor.inputs_and_outputs = SimpleNamespace(compute_stream=None, prepare_batch_update=lambda: ([], [], None))
+    manager.batch_processor = processor
+    return manager, processor, scheduler
+
+
+def _start_generation_loop(manager, processor) -> tuple[threading.Thread, list[BaseException]]:
+    """Run the real loop body until it stops. Returns the thread and any exception it raised."""
+    errors: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            while manager._generation_loop_body(processor, bootstrapping=False):
+                pass
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    manager._generation_thread = thread
+    thread.start()
+    return thread, errors
+
+
+def _stop_generation_loop(manager, thread: threading.Thread) -> None:
+    """Ask the loop to hard-stop and wait until it leaves `_generation_loop_body`."""
+    manager.background_thread_status.request_stop(BackgroundThreadStatus.HARD_STOP, global_rank=0)
+    manager._wake_up_loop.set()
+    thread.join(timeout=5)
+    if thread.is_alive():
+        raise RuntimeError("generation loop did not exit after hard stop")
+
+
+def _drain_outputs(manager) -> list[GenerationOutput]:
+    outputs = []
+    while not manager.output_router.output_queue.empty():
+        outputs.append(manager.output_router.output_queue.get_nowait())
+    return outputs
+
+
+class ContinuousBatchingCancellationTest(unittest.TestCase):
+    """Cancellation must publish one terminal failure and must not resurrect an in-flight request.
+
+    The manager is the model-free fixture used by the pause tests: no weights and no accelerator. A join timeout only
+    fails the test when the waiter is still blocked; the assertion is the terminal output itself.
+    """
+
+    def test_cancel_unblocks_request_id_iter_with_one_failure(self) -> None:
+        """A non-streaming waiter blocked in `request_id_iter` receives one FAILED output and returns."""
+        manager, processor, scheduler = _build_model_free_manager()
+        state = _cb_request("req", generated=[4, 5], streaming=False)
+        scheduler.active_requests["req"] = state
+        thread, errors = _start_generation_loop(manager, processor)
+        collected: list[GenerationOutput] = []
+        collector = threading.Thread(target=lambda: collected.extend(manager.request_id_iter("req")), daemon=True)
+        collector.start()
+        try:
+            manager.cancel_request("req")
+            collector.join(timeout=5)
+            self.assertFalse(collector.is_alive(), f"request_id_iter kept waiting; loop errors={errors}")
+            self.assertEqual(errors, [])
+            self.assertEqual(len(collected), 1)
+            output = collected[0]
+            self.assertEqual(output.request_id, "req")
+            self.assertEqual(output.status, RequestStatus.FAILED)
+            self.assertNotEqual(output.status, RequestStatus.FINISHED)
+            self.assertTrue(output.is_finished())
+            self.assertIsNotNone(output.error)
+            self.assertIn("cancelled", output.error)
+            self.assertEqual(output.generated_tokens, [4, 5])
+            self.assertTrue(manager.output_router.output_queue.empty())
+            self.assertNotIn("req", scheduler.active_requests)
+            self.assertNotIn("req", scheduler.waiting_requests)
+        finally:
+            _stop_generation_loop(manager, thread)
+            collector.join(timeout=5)
+
+    def test_cancel_removes_the_result_handler(self) -> None:
+        """The callback registered for a request runs once with a terminal failure, then the handler is dropped."""
+        manager, processor, scheduler = _build_model_free_manager()
+        state = _cb_request("req", generated=[4], streaming=True)
+        scheduler.active_requests["req"] = state
+
+        async def _wait_for_handler() -> None:
+            thread, errors = _start_generation_loop(manager, processor)
+            received: list[GenerationOutput] = []
+            try:
+                manager.register_result_handler("req", received.append)
+                manager.cancel_request("req")
+                for _ in range(100):
+                    if received:
+                        break
+                    await asyncio.sleep(0.02)
+                self.assertEqual(len(received), 1, f"handler was not called; loop errors={errors}")
+                output = received[0]
+                self.assertEqual(output.status, RequestStatus.FAILED)
+                self.assertTrue(output.is_finished())
+                self.assertIn("cancelled", output.error)
+                self.assertEqual(output.generated_tokens, [4])
+                # A second cancellation, or a late duplicate delivery, must not call the handler again.
+                manager.cancel_request("req")
+                await asyncio.sleep(0.05)
+                self.assertEqual(len(received), 1)
+                self.assertNotIn("req", manager.output_router.result_handlers)
+                self.assertTrue(manager.output_router.output_queue.empty())
+                self.assertEqual(errors, [])
+            finally:
+                _stop_generation_loop(manager, thread)
+
+        asyncio.run(_wait_for_handler())
+
+    def test_cancel_of_waiting_and_not_yet_admitted_requests(self) -> None:
+        """A waiting request and one still in the input queue each produce one failure. Unknown ids produce none."""
+        manager, processor, scheduler = _build_model_free_manager()
+        waiting = _cb_request("waiting", status=RequestStatus.PENDING)
+        queued = _cb_request("queued", status=RequestStatus.PENDING)
+        scheduler.add_waiting_request(waiting)
+        manager.input_queue.put(queued)
+        manager.cancel_request("waiting")
+        manager.cancel_request("queued")
+        manager.cancel_request("missing")
+
+        self.assertFalse(processor.prepare_next_batch())
+
+        outputs = _drain_outputs(manager)
+        self.assertEqual({output.request_id for output in outputs}, {"waiting", "queued"})
+        for output in outputs:
+            self.assertEqual(output.status, RequestStatus.FAILED)
+            self.assertTrue(output.is_finished())
+            self.assertIn("cancelled", output.error)
+        self.assertEqual(scheduler.active_requests, {})
+        self.assertEqual(scheduler.waiting_requests, {})
+        self.assertEqual(list(scheduler.waiting_requests_order), [])
+
+        manager.cancel_request("waiting")
+        manager.cancel_request("queued")
+        self.assertFalse(processor.prepare_next_batch())
+        self.assertEqual(_drain_outputs(manager), [])
+
+    def test_inflight_update_does_not_revive_cancelled_request(self) -> None:
+        """A batch that was already in flight must not apply its token or fork the cancelled request back into life."""
+        for use_async in (False, True):
+            with self.subTest(use_async=use_async):
+                manager, processor, scheduler = _build_model_free_manager()
+                processor.use_async_batching = use_async
+                cancelled = _cb_request("c", max_new_tokens=1, streaming=True, num_children=2)
+                prefill = _cb_request("p", status=RequestStatus.PREFILLING)
+                survivor = _cb_request("s", max_new_tokens=8, streaming=True)
+                scheduler.active_requests["c"] = cancelled
+                scheduler.active_requests["p"] = prefill
+                scheduler.active_requests["s"] = survivor
+                scheduler._requests_to_fork.append(cancelled)
+                marked: list[str] = []
+                scheduler.cache.mark_complete_blocks = lambda state, blocks: marked.append(state.request_id)
+                scheduler.cache.cache_allocators = {}
+                scheduler.cache.prepare_fork_request = lambda *args, **kwargs: []
+                scheduler.cache.pool.try_to_free_sectors = lambda: None
+                scheduler.schedule_batch = lambda token_budget, cache_budget: ([], False, 0, 0)
+
+                manager.cancel_request("c")
+                manager.cancel_request("p")
+                self.assertFalse(processor.prepare_next_batch())
+                self.assertEqual(cancelled.status, RequestStatus.FAILED)
+                self.assertEqual(prefill.status, RequestStatus.FAILED)
+                self.assertEqual(scheduler._requests_to_fork, [])
+                self.assertNotIn("c", scheduler.active_requests)
+                self.assertIn("s", scheduler.active_requests)
+
+                in_flight = [
+                    FutureRequestState(prefill, has_new_token=False, complete_blocks={"full": 1}, query_length=2),
+                    FutureRequestState(cancelled, has_new_token=True, complete_blocks={}, query_length=1),
+                    FutureRequestState(survivor, has_new_token=True, complete_blocks={}, query_length=1),
+                ]
+                processor.inputs_and_outputs = SimpleNamespace(
+                    prepare_batch_update=lambda: (in_flight, [111, 222], None),
+                    compute_stream=None,
+                )
+                scheduler.cache.free_blocks.reset_mock()
+                processor.update_batch()
+
+                self.assertEqual(cancelled.status, RequestStatus.FAILED)
+                self.assertEqual(cancelled.generated_tokens, [])
+                self.assertIn("cancelled", cancelled.error)
+                self.assertEqual(prefill.status, RequestStatus.FAILED)
+                self.assertNotIn("c", scheduler.active_requests)
+                self.assertNotIn("p", scheduler.active_requests)
+                for child_id in ("c__child#0", "c__child#1"):
+                    self.assertNotIn(child_id, scheduler.active_requests)
+                    self.assertNotIn(child_id, scheduler.waiting_requests)
+                self.assertEqual(survivor.generated_tokens, [222])
+                self.assertEqual(survivor.status, RequestStatus.DECODING)
+                self.assertIsNone(survivor.error)
+                self.assertIn("s", scheduler.active_requests)
+                self.assertEqual(marked, ["s"])
+                scheduler.cache.free_blocks.assert_not_called()
+
+                outputs = _drain_outputs(manager)
+                cancelled_outputs = [output for output in outputs if output.request_id == "c"]
+                prefill_outputs = [output for output in outputs if output.request_id == "p"]
+                survivor_outputs = [output for output in outputs if output.request_id == "s"]
+                self.assertEqual(len(cancelled_outputs), 1)
+                self.assertEqual(cancelled_outputs[0].status, RequestStatus.FAILED)
+                self.assertTrue(cancelled_outputs[0].is_finished())
+                self.assertEqual(len(prefill_outputs), 1)
+                self.assertTrue(prefill_outputs[0].is_finished())
+                self.assertEqual(len(survivor_outputs), 1)
+                self.assertFalse(survivor_outputs[0].is_finished())
+                self.assertEqual(survivor_outputs[0].generated_tokens, [222])
+                self.assertIsNone(survivor_outputs[0].error)
+
+    def test_sync_update_still_rejects_finished_and_offloaded_requests(self) -> None:
+        """Synchronous batching still raises if a finished or offloaded request shows up in the batch being updated."""
+        _manager, processor, scheduler = _build_model_free_manager()
+        processor.use_async_batching = False
+        for status in (RequestStatus.FINISHED, RequestStatus.PENDING):
+            with self.subTest(status=status):
+                state = _cb_request("req", status=status)
+                processor.inputs_and_outputs = SimpleNamespace(
+                    prepare_batch_update=lambda state=state: (
+                        [FutureRequestState(state, has_new_token=True, complete_blocks={}, query_length=1)],
+                        [7],
+                        None,
+                    ),
+                    compute_stream=None,
+                )
+                with self.assertRaises(RuntimeError):
+                    processor.update_batch()
+                self.assertNotIn("req", scheduler.active_requests)
+
+    def test_batch_error_does_not_emit_a_second_output_for_a_cancelled_request(self) -> None:
+        """A later batch failure must not deliver another output for a request cancellation already published."""
+        manager, processor, scheduler = _build_model_free_manager()
+        state = _cb_request("c", generated=[4])
+        scheduler.active_requests["c"] = state
+        manager.cancel_request("c")
+        self.assertFalse(processor.prepare_next_batch())
+        self.assertEqual(len(_drain_outputs(manager)), 1)
+
+        processor.inputs_and_outputs = SimpleNamespace(
+            prepare_batch_update=lambda: (
+                [FutureRequestState(state, has_new_token=True, complete_blocks={}, query_length=1)],
+                [9],
+                None,
+            )
+        )
+        processor.handle_batch_error(RuntimeError("forward failed"))
+
+        self.assertEqual(_drain_outputs(manager), [])
+        self.assertEqual(state.status, RequestStatus.FAILED)
+        self.assertIn("cancelled", state.error)
+        self.assertEqual(state.generated_tokens, [4])
+
+        # The production failure path is `fail_all_requests`, which has to keep the same guard.
+        other = _cb_request("other", status=RequestStatus.PENDING)
+        scheduler.add_waiting_request(other)
+        processor.fail_all_requests(RuntimeError("generation loop finished"))
+        outputs = _drain_outputs(manager)
+        self.assertEqual([output.request_id for output in outputs], ["other"])
+        self.assertIn("generation loop finished", outputs[0].error)
+        self.assertIn("cancelled", state.error)
+        self.assertNotIn("generation loop finished", state.error)
+        self.assertNotIn("c", scheduler.active_requests)
+
+    def test_cancel_arriving_during_the_forward_does_not_publish_success(self) -> None:
+        """A cancel that is still queued when `update_batch` runs must not commit the in-flight token or fork children."""
+        for use_async in (False, True):
+            with self.subTest(use_async=use_async):
+                manager, processor, scheduler = _build_model_free_manager()
+                processor.use_async_batching = use_async
+                if use_async:
+                    # Two forwards are still unsynced: this update may retire only one of them.
+                    processor._unsynced_forwards = 2
+                cancelled = _cb_request("c", max_new_tokens=1, streaming=True, num_children=2)
+                survivor = _cb_request("s", max_new_tokens=8, streaming=True)
+                scheduler.active_requests["c"] = cancelled
+                scheduler.active_requests["s"] = survivor
+                scheduler._requests_to_fork.append(cancelled)
+                in_flight = [
+                    FutureRequestState(cancelled, has_new_token=True, complete_blocks={}, query_length=1),
+                    FutureRequestState(survivor, has_new_token=True, complete_blocks={}, query_length=1),
+                ]
+                processor.inputs_and_outputs = SimpleNamespace(
+                    prepare_batch_update=lambda: (in_flight, [111, 222], None),
+                    compute_stream=None,
+                )
+                manager.cancel_request("c")
+                processor.update_batch()
+
+                self.assertEqual(cancelled.status, RequestStatus.FAILED)
+                self.assertIn("cancelled", cancelled.error)
+                self.assertEqual(cancelled.generated_tokens, [])
+                self.assertNotEqual(cancelled.status, RequestStatus.FINISHED)
+                self.assertEqual(scheduler._requests_to_fork, [])
+                self.assertNotIn("c", scheduler.active_requests)
+                for child_id in ("c__child#0", "c__child#1"):
+                    self.assertNotIn(child_id, scheduler.active_requests)
+                    self.assertNotIn(child_id, scheduler.waiting_requests)
+                self.assertEqual(survivor.generated_tokens, [222])
+                self.assertEqual(survivor.status, RequestStatus.DECODING)
+                self.assertIsNone(survivor.error)
+
+                outputs = _drain_outputs(manager)
+                cancelled_outputs = [output for output in outputs if output.request_id == "c"]
+                survivor_outputs = [output for output in outputs if output.request_id == "s"]
+                self.assertEqual(len(cancelled_outputs), 1)
+                self.assertEqual(cancelled_outputs[0].status, RequestStatus.FAILED)
+                self.assertTrue(cancelled_outputs[0].is_finished())
+                self.assertEqual(len(survivor_outputs), 1)
+                self.assertEqual(survivor_outputs[0].generated_tokens, [222])
+
+                if use_async:
+                    scheduler.cache.free_blocks.assert_not_called()
+                    processor._note_async_forward_synced()
+                scheduler.cache.free_blocks.assert_any_call("c")
+
+    def test_requeued_fork_child_can_be_cancelled_at_generation_zero(self) -> None:
+        """A child id is new, so its generation is 0 even when the parent's submission generation is not."""
+        manager, processor, scheduler = _build_model_free_manager()
+        parent = _cb_request("parent", num_children=2)
+        parent.generation = 5
+        scheduler.active_requests["parent"] = parent
+        scheduler._requests_to_fork.append(parent)
+        scheduler.cache.cache_allocators = {}
+        scheduler.cache.prepare_fork_request = lambda *_args, **_kwargs: ["parent__child#0"]
+        scheduler.cache.pool.try_to_free_sectors = lambda: None
+        processor.inputs_and_outputs = SimpleNamespace(
+            prepare_batch_update=lambda: ([], [], None),
+            compute_stream=None,
+        )
+
+        processor.update_batch()
+
+        forked = scheduler.active_requests["parent__child#0"]
+        requeued = scheduler.waiting_requests["parent__child#1"]
+        self.assertEqual(forked.generation, 0)
+        self.assertEqual(requeued.generation, 0)
+        self.assertEqual(parent.generation, 5)
+        manager.cancel_request("parent__child#0")
+        manager.cancel_request("parent__child#1")
+        self.assertFalse(processor.prepare_next_batch())
+        self.assertEqual(forked.status, RequestStatus.FAILED)
+        self.assertEqual(requeued.status, RequestStatus.FAILED)
+        self.assertIn("cancelled", forked.error)
+        self.assertIn("cancelled", requeued.error)
+        self.assertIn("parent", scheduler.active_requests)
+        self.assertEqual(parent.status, RequestStatus.DECODING)
+
+    def test_cancelling_the_last_active_request_unblocks_the_scheduler(self) -> None:
+        """Offload blocks new prefills until a finish. Cancelling the last active request has to clear that too."""
+        _manager, processor, scheduler = _build_model_free_manager()
+        active = _cb_request("active")
+        waiting = _cb_request("waiting", status=RequestStatus.PENDING)
+        scheduler.active_requests["active"] = active
+        scheduler.add_waiting_request(waiting)
+        scheduler.block_new_requests = True
+
+        self.assertFalse(processor.prepare_next_batch())
+        self.assertTrue(scheduler.block_new_requests)
+        self.assertIn("active", scheduler.active_requests)
+
+        _manager.cancel_request("active")
+        self.assertFalse(processor.prepare_next_batch())
+        self.assertFalse(scheduler.block_new_requests)
+        self.assertNotIn("active", scheduler.active_requests)
+        self.assertIn("waiting", scheduler.waiting_requests)
+        self.assertEqual(active.status, RequestStatus.FAILED)
+        self.assertIn("cancelled", active.error)
+
+    def test_hard_stop_fails_queued_requests_and_does_not_finish_a_cancelled_one(self) -> None:
+        """Hard stop must fail a request that was only queued, and must not publish a cancelled one as success."""
+        manager, processor, scheduler = _build_model_free_manager()
+        manager.background_thread_status.request_stop(BackgroundThreadStatus.HARD_STOP, global_rank=0)
+        active = _cb_request("live", generated=[4], max_new_tokens=1, streaming=True)
+        queued = _cb_request("queued", status=RequestStatus.PENDING)
+        scheduler.active_requests["live"] = active
+        manager.input_queue.put(queued)
+        manager.cancel_request("live")
+
+        self.assertFalse(processor.prepare_next_batch())
+        self.assertTrue(manager.input_queue.empty())
+        self.assertTrue(manager.cancel_queue.empty())
+        self.assertEqual(active.status, RequestStatus.FAILED)
+        self.assertIn("cancelled", active.error)
+        self.assertEqual(queued.status, RequestStatus.FAILED)
+        self.assertIn("Generation loop finished", queued.error)
+        self.assertIn("tp_status", queued.error)
+        self.assertNotIn("queued", scheduler.waiting_requests)
+        self.assertNotIn("live", scheduler.active_requests)
+
+        outputs = _drain_outputs(manager)
+        self.assertEqual({output.request_id for output in outputs}, {"live", "queued"})
+        live_output = next(output for output in outputs if output.request_id == "live")
+        queued_output = next(output for output in outputs if output.request_id == "queued")
+        self.assertEqual(live_output.status, RequestStatus.FAILED)
+        self.assertIn("cancelled", live_output.error)
+        self.assertIn("Generation loop finished", queued_output.error)
+
+        processor.inputs_and_outputs = SimpleNamespace(
+            prepare_batch_update=lambda: (
+                [FutureRequestState(active, has_new_token=True, complete_blocks={}, query_length=1)],
+                [999],
+                None,
+            ),
+            compute_stream=None,
+        )
+        processor.update_batch()
+        self.assertEqual(active.status, RequestStatus.FAILED)
+        self.assertEqual(active.generated_tokens, [4])
+        self.assertEqual(_drain_outputs(manager), [])
+
+    def test_stale_cancel_does_not_fail_a_newer_request(self) -> None:
+        """A cancellation names a generation. A newer submission of that id stays queued."""
+        manager, processor, scheduler = _build_model_free_manager()
+        state = _cb_request("req", status=RequestStatus.PENDING)
+        state.generation = 2
+        scheduler.add_waiting_request(state)
+        manager.cancel_queue.put(("req", 1))
+
+        self.assertFalse(processor.prepare_next_batch())
+        self.assertIs(scheduler.waiting_requests["req"], state)
+        self.assertEqual(state.status, RequestStatus.PENDING)
+        self.assertEqual(_drain_outputs(manager), [])
+
+        manager.cancel_queue.put(("req", 2))
+        self.assertFalse(processor.prepare_next_batch())
+        self.assertNotIn("req", scheduler.waiting_requests)
+        self.assertEqual(state.status, RequestStatus.FAILED)
+        outputs = _drain_outputs(manager)
+        self.assertEqual(len(outputs), 1)
+        self.assertIn("cancelled", outputs[0].error)
+
+    def test_cancel_fails_both_the_active_and_waiting_state(self) -> None:
+        """The same id can sit in both queues. Each state gets its own terminal output."""
+        manager, processor, scheduler = _build_model_free_manager()
+        active = _cb_request("both", generated=[3])
+        waiting = _cb_request("both", status=RequestStatus.PENDING)
+        active.generation = 4
+        waiting.generation = 4
+        scheduler.active_requests["both"] = active
+        scheduler.add_waiting_request(waiting)
+        manager.cancel_queue.put(("both", 4))
+
+        self.assertFalse(processor.prepare_next_batch())
+        self.assertNotIn("both", scheduler.active_requests)
+        self.assertNotIn("both", scheduler.waiting_requests)
+        self.assertNotIn("both", scheduler.waiting_requests_order)
+        self.assertEqual(active.status, RequestStatus.FAILED)
+        self.assertEqual(waiting.status, RequestStatus.FAILED)
+        outputs = _drain_outputs(manager)
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(
+            all(output.status == RequestStatus.FAILED and "cancelled" in output.error for output in outputs)
+        )
+
+    def test_request_is_cancelled_is_false_for_a_normal_finish_and_an_unknown_id(self) -> None:
+        """Absence from the scheduler is not cancellation. A live id is cancelled only while a cancel is pending."""
+        manager, processor, scheduler = _build_model_free_manager()
+        state = _cb_request("req")
+        scheduler.active_requests["req"] = state
+        scheduler.finish_request("req")
+        self.assertFalse(scheduler.request_is_cancelled("req"))
+
+        manager.cancel_request("unknown")
+        self.assertFalse(processor.prepare_next_batch())
+        self.assertFalse(scheduler.request_is_cancelled("unknown"))
+
+        scheduler.active_requests["req"] = state
+        manager.cancel_request("req")
+        self.assertFalse(processor.prepare_next_batch())
+        self.assertTrue(scheduler.request_is_cancelled("req"))
+        self.assertNotIn("req", scheduler.active_requests)
+
+        scheduler.active_requests["req"] = _cb_request("req")
+        self.assertFalse(scheduler.request_is_cancelled("req"))
+        # Queuing a cancel does not mark it until the generation thread ingests the queue.
+        scheduler.set_request_cancellation("req", 0)
+        self.assertTrue(scheduler.request_is_cancelled("req"))
+
+        scheduler.reset()
+        self.assertFalse(scheduler.request_is_cancelled("req"))
+        self.assertEqual(scheduler._applied_cancellations, set())
+
+    def test_applied_cancellation_memory_is_bounded(self) -> None:
+        """Remembering cancelled ids must not grow without a limit, and `reset` drops the record."""
+        _manager, _processor, scheduler = _build_model_free_manager()
+        total = _APPLIED_CANCELLATION_LIMIT + 2
+        for i in range(total):
+            request_id = f"r{i}"
+            scheduler.active_requests[request_id] = _cb_request(request_id)
+            scheduler.set_request_cancellation(request_id, 0)
+        removed = scheduler.clear_cancelled_requests()
+        self.assertEqual(len(removed), total)
+        self.assertEqual(len(scheduler._applied_cancellations), _APPLIED_CANCELLATION_LIMIT)
+        self.assertNotIn("r0", scheduler._applied_cancellations)
+        self.assertFalse(scheduler.request_is_cancelled("r0"))
+        newest = f"r{total - 1}"
+        self.assertIn(newest, scheduler._applied_cancellations)
+        self.assertTrue(scheduler.request_is_cancelled(newest))
+        scheduler.reset()
+        self.assertFalse(scheduler.request_is_cancelled(newest))
+
+    def test_older_submission_is_replaced_when_the_same_id_is_reused(self) -> None:
+        """A newer queued submission retires the live one. An equal or older one is the submission that fails."""
+        manager, processor, scheduler = _build_model_free_manager()
+        old = _cb_request("req", generated=[1])
+        old.generation = 1
+        scheduler.active_requests["req"] = old
+        newer = _cb_request("req", status=RequestStatus.PENDING)
+        newer.generation = 2
+        manager.input_queue.put(newer)
+        manager.cancel_queue.put(("req", 1))
+
+        self.assertFalse(processor.prepare_next_batch())
+        self.assertIs(scheduler.waiting_requests["req"], newer)
+        self.assertEqual(newer.status, RequestStatus.PENDING)
+        self.assertNotIn("req", scheduler.active_requests)
+        self.assertEqual(old.status, RequestStatus.FAILED)
+        self.assertIn("replaced", old.error)
+        outputs = _drain_outputs(manager)
+        self.assertEqual(len(outputs), 1)
+        self.assertIn("replaced", outputs[0].error)
+
+        current = _cb_request("same")
+        current.generation = 3
+        scheduler.active_requests["same"] = current
+        duplicate = _cb_request("same", status=RequestStatus.PENDING)
+        duplicate.generation = 3
+        manager.input_queue.put(duplicate)
+        self.assertFalse(processor.prepare_next_batch())
+        self.assertIs(scheduler.active_requests["same"], current)
+        self.assertNotIn("same", scheduler.waiting_requests)
+        self.assertEqual(duplicate.status, RequestStatus.FAILED)
+        self.assertIn("already queued", duplicate.error)
+
+        kept = _cb_request("newer-live")
+        kept.generation = 5
+        scheduler.active_requests["newer-live"] = kept
+        stale = _cb_request("newer-live", status=RequestStatus.PENDING)
+        stale.generation = 4
+        manager.input_queue.put(stale)
+        self.assertFalse(processor.prepare_next_batch())
+        self.assertIs(scheduler.active_requests["newer-live"], kept)
+        self.assertEqual(stale.status, RequestStatus.FAILED)
+        self.assertIn("newer request", stale.error)
+        self.assertEqual(kept.status, RequestStatus.DECODING)
+
+    def test_replacing_a_handler_is_not_undone_by_the_previous_callback(self) -> None:
+        """A finished callback drops only the handler it belongs to, and only a matching generation."""
+
+        async def _run() -> None:
+            manager, _processor, _scheduler = _build_model_free_manager()
+            seen: list[str] = []
+            manager.register_result_handler("req", lambda _output: seen.append("first"))
+            stale = manager.output_router.result_handlers["req"][0]
+            manager.register_result_handler("req", lambda _output: seen.append("second"))
+            stale(GenerationOutput(request_id="req", status=RequestStatus.FINISHED, generated_tokens=[1]))
+            self.assertEqual(seen, ["first"])
+            self.assertIn("req", manager.output_router.result_handlers)
+            self.assertIsNot(manager.output_router.result_handlers["req"][0], stale)
+
+            manager.output_router.handler_generations["req"] = 5
+            current = manager.output_router.result_handlers["req"][0]
+            current(
+                GenerationOutput(request_id="req", status=RequestStatus.FINISHED, generated_tokens=[1], generation=4)
+            )
+            self.assertEqual(seen, ["first"])
+            self.assertIn("req", manager.output_router.result_handlers)
+
+            manager._request_generation["req"] = 5
+            current(
+                GenerationOutput(request_id="req", status=RequestStatus.FINISHED, generated_tokens=[1], generation=5)
+            )
+            self.assertEqual(seen, ["first", "second"])
+            self.assertNotIn("req", manager.output_router.result_handlers)
+            self.assertNotIn("req", manager._request_generation)
+
+            manager.register_result_handler("again", lambda _output: seen.append("again"))
+            manager._request_generation["again"] = 9
+            again = manager.output_router.result_handlers["again"][0]
+            again(
+                GenerationOutput(request_id="again", status=RequestStatus.FINISHED, generated_tokens=[1], generation=4)
+            )
+            self.assertNotIn("again", manager.output_router.result_handlers)
+            self.assertEqual(manager._request_generation["again"], 9)
+
+        asyncio.run(_run())
 
 
 @require_torch_accelerator

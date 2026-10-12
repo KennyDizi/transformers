@@ -19,6 +19,9 @@ from .cache import PagedAttentionCache
 from .requests import FutureRequestState, RequestState, RequestStatus, logger
 
 
+_APPLIED_CANCELLATION_LIMIT = 4096
+
+
 class Scheduler(ABC):
     """
     Abstract base class for scheduling requests in the continuous batch processor. Schedulers manage the lifecycle of
@@ -48,9 +51,13 @@ class Scheduler(ABC):
         self.active_requests: dict[str, RequestState] = {}
         self.waiting_requests: dict[str, RequestState] = {}
         self.waiting_requests_order: deque[str] = deque()
-        self._requests_to_cancel: set[str] = set()
+        self._requests_to_cancel: dict[str, int] = {}
         self._requests_to_fork: list[RequestState] = []
         self.block_new_requests = False
+        # Ids whose live state was actually removed. Absence from the queues is not cancellation: a finished request
+        # and an unknown id are absent too. Bounded so a long-running server does not retain every id forever.
+        self._applied_cancellations: set[str] = set()
+        self._applied_cancellation_order: deque[str] = deque()
         # Active requests that failed cache allocation in the last scheduled batch w/ the length that was denied
         self.starved_requests: list[tuple[RequestState, int]] = []
 
@@ -87,33 +94,68 @@ class Scheduler(ABC):
             return self.active_requests[request_id].generated_tokens
         return []
 
-    def set_request_cancellation(self, request_id: str):
-        """Marks a request for cancellation."""
+    def set_request_cancellation(self, request_id: str, generation: int = 0) -> None:
+        """Marks a request for cancellation.
+
+        `generation` is the submission the caller observed. A newer submission of the same id is left in place. When
+        several cancellations are pending, the highest generation wins.
+        """
         with self._cancellation_lock:
-            self._requests_to_cancel.add(request_id)
+            current = self._requests_to_cancel.get(request_id)
+            if current is None or generation > current:
+                self._requests_to_cancel[request_id] = generation
+
+    def _remember_applied_cancellation(self, request_id: str) -> None:
+        if request_id in self._applied_cancellations:
+            return
+        self._applied_cancellations.add(request_id)
+        self._applied_cancellation_order.append(request_id)
+        while len(self._applied_cancellation_order) > _APPLIED_CANCELLATION_LIMIT:
+            self._applied_cancellations.discard(self._applied_cancellation_order.popleft())
 
     def clear_cancelled_requests(self) -> list[RequestState]:
-        """Remove all cancelled requests from active and waiting queues."""
-        cancelled_states = []
+        """Remove cancelled requests from the active queue, the waiting queue, and the fork list.
+
+        A request is removed only when its generation is less than or equal to the cancelled generation. Both the
+        active and the waiting state are returned when both match, so each one can be failed. KV blocks are not freed
+        here: an async forward may still be writing them, and the processor retires them after that forward syncs.
+
+        If nothing active remains, `block_new_requests` is cleared. Offload sets that flag and only a normal finish
+        used to clear it, so cancelling the last active request would leave waiting requests unscheduled forever.
+        """
+        cancelled_states: list[RequestState] = []
         with self._cancellation_lock:
-            for request_id in self._requests_to_cancel:
-                state_a = self.active_requests.pop(request_id, None)
-                state_w = self.waiting_requests.pop(request_id, None)
-                # Invariant: a request is never in both queues; state_a or state_w picks the one it was in
-                state = state_a or state_w
-                if state is not None:
-                    cancelled_states.append(state)
-                if request_id in self.waiting_requests_order:
-                    self.waiting_requests_order.remove(request_id)
-                self.cache.free_blocks(request_id)
-            self._requests_to_cancel = set()
+            pending = dict(self._requests_to_cancel)
+            self._requests_to_cancel = {}
+            for request_id, generation in pending.items():
+                for mapping in (self.active_requests, self.waiting_requests):
+                    state = mapping.get(request_id)
+                    if state is not None and state.generation <= generation:
+                        mapping.pop(request_id, None)
+                        cancelled_states.append(state)
+                        self._remember_applied_cancellation(request_id)
+                if request_id not in self.waiting_requests:
+                    while request_id in self.waiting_requests_order:
+                        self.waiting_requests_order.remove(request_id)
+            if pending:
+                self._requests_to_fork = [
+                    state for state in self._requests_to_fork if pending.get(state.request_id, -1) < state.generation
+                ]
+            if not self.active_requests:
+                self.block_new_requests = False
         return cancelled_states
 
     def request_is_cancelled(self, request_id: str) -> bool:
-        """Checks if a request has been cancelled or removed."""
-        return request_id in self._requests_to_cancel or (
-            request_id not in self.active_requests and request_id not in self.waiting_requests
-        )
+        """Whether a cancellation of this id is pending, or already removed a live request.
+
+        A normally finished request, an unknown id, and an id that is active or waiting again are not cancelled.
+        """
+        with self._cancellation_lock:
+            pending = request_id in self._requests_to_cancel
+            applied = request_id in self._applied_cancellations
+        if request_id in self.active_requests or request_id in self.waiting_requests:
+            return pending
+        return pending or applied
 
     def _infer_request_tokens(self, state: RequestState, request_ids_to_remove_from_waiting: set[str]) -> list[int]:
         """Prepares a request for processing in the current batch. If prefix sharing is enabled, and the request was
