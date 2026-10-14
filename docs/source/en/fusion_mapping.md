@@ -54,6 +54,8 @@ Fusion registration happens before the model is instantiated:
 5. Matching [`~WeightTransform`] rules are generated from the config so checkpoint loading can map weights into the fused runtime layout.
 6. By default, [`~PreTrainedModel.save_pretrained`] uses the reverse conversion path to restore the original checkpoint layout. Pass `save_original_format=False` to keep the converted runtime layout instead.
 
+These registrations belong to the `from_pretrained` call that creates them. When that call returns, or if it fails, the global patch and conversion registries are left as they were. The loaded model still exposes its fusion transforms through `get_model_conversion_mapping`, which adapter loading, quantized loading, and the save fallback consult later. A later load in the same process does not reuse another load's fusion.
+
 This lets a fusion use a different runtime module structure while still loading from the original checkpoint format, and by default saving back to it as well.
 
 Note: With the current monkey-patching mechanism, fusion registration is class-level: one compatible module class maps to one fused replacement class.

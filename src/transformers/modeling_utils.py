@@ -93,6 +93,7 @@ from .pytorch_utils import id_tensor_storage
 from .quantizers import HfQuantizer
 from .quantizers.auto import get_hf_quantizer
 from .quantizers.quantizers_utils import get_module_from_name
+from .registration_scope import load_registration_scope
 from .safetensors_conversion import auto_conversion
 from .utils import (
     ADAPTER_SAFE_WEIGHTS_NAME,
@@ -4263,50 +4264,56 @@ class PreTrainedModel(
         if fusion_config is not None:
             config.fusion_config = copy.deepcopy(fusion_config)
 
-        # Register fusion patches
-        fusion_config = getattr(config, "fusion_config", None)
-        if fusion_config is not None:
-            from .fusion_mapping import register_fusion_patches
+        # Fusion and kernel registrations belong to this load. They are visible while the model is
+        # built and its checkpoint mapping is collected, then dropped from the global registries,
+        # including when loading fails. The returned model keeps the conversion rules.
+        with load_registration_scope() as load_scope:
+            # Register fusion patches
+            fusion_config = getattr(config, "fusion_config", None)
+            if fusion_config is not None:
+                from .fusion_mapping import register_fusion_patches
 
-            register_fusion_patches(cls, config, fusion_config)
+                register_fusion_patches(cls, config, fusion_config)
 
-        # Kernel patches: single-layer replacement (stateful __init__) then fusions.
-        if kernel_config is not None and use_kernels:
-            from .integrations.hub_kernels import register_kernel_replacements_and_fusions
+            # Kernel patches: single-layer replacement (stateful __init__) then fusions.
+            if kernel_config is not None and use_kernels:
+                from .integrations.hub_kernels import register_kernel_replacements_and_fusions
 
-            # For remote kernels, we need to apply the context manager
-            allow_all_kernels_context = [allow_all_hub_kernels()] if allow_all_kernels else []
-            with ContextManagers(allow_all_kernels_context):
-                register_kernel_replacements_and_fusions(cls, config, kernel_config)
+                # For remote kernels, we need to apply the context manager
+                allow_all_kernels_context = [allow_all_hub_kernels()] if allow_all_kernels else []
+                with ContextManagers(allow_all_kernels_context):
+                    register_kernel_replacements_and_fusions(cls, config, kernel_config)
 
-        model_init_context = cls.get_init_context(dtype, is_quantized, _is_ds_init_called, allow_all_kernels)
+            model_init_context = cls.get_init_context(dtype, is_quantized, _is_ds_init_called, allow_all_kernels)
 
-        config = copy.deepcopy(config)  # We do not want to modify the config inplace in from_pretrained.
-        with ContextManagers(model_init_context):
-            model = cls(config, *model_args, **model_kwargs)
-            patch_output_recorders(model)
+            config = copy.deepcopy(config)  # We do not want to modify the config inplace in from_pretrained.
+            with ContextManagers(model_init_context):
+                model = cls(config, *model_args, **model_kwargs)
+                patch_output_recorders(model)
 
-            if hf_quantizer is not None:  # replace module with quantized modules (does not touch weights)
-                hf_quantizer.preprocess_model(
-                    model=model,
-                    dtype=dtype,
-                    device_map=device_map,
-                    checkpoint_files=checkpoint_files,
-                    use_kernels=use_kernels,
-                )
+                if hf_quantizer is not None:  # replace module with quantized modules (does not touch weights)
+                    hf_quantizer.preprocess_model(
+                        model=model,
+                        dtype=dtype,
+                        device_map=device_map,
+                        checkpoint_files=checkpoint_files,
+                        use_kernels=use_kernels,
+                    )
 
-        if gguf_file:
-            state_dict = hf_quantizer.get_state_dict(checkpoint_files[0], model)
+            if gguf_file:
+                state_dict = hf_quantizer.get_state_dict(checkpoint_files[0], model)
 
-        # Create the dtype_plan to potentially use the `keep_in_fp32` flags (this needs to be called on the already
-        # instantiated model, as the flags can be modified by instances sometimes)
-        dtype_plan = model._get_dtype_plan(dtype)
+            # Create the dtype_plan to potentially use the `keep_in_fp32` flags (this needs to be called on the already
+            # instantiated model, as the flags can be modified by instances sometimes)
+            dtype_plan = model._get_dtype_plan(dtype)
 
-        # Obtain the weight conversion mapping for this model if any are registered and apply to all submodels recursively
-        weight_conversions = get_model_conversion_mapping(model, key_mapping, hf_quantizer)
+            # Obtain the weight conversion mapping for this model if any are registered and apply to all submodels recursively
+            weight_conversions = get_model_conversion_mapping(model, key_mapping, hf_quantizer)
 
-        if distributed_config is not None:
-            model = cls.maybe_distribute_model(model, distributed_config, mesh_manager)
+            if distributed_config is not None:
+                model = cls.maybe_distribute_model(model, distributed_config, mesh_manager)
+
+            load_scope.attach_conversions(model)
 
         # Prepare the full device map
         if device_map is not None:

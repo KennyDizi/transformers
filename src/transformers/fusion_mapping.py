@@ -192,9 +192,12 @@ def _register_module_fusion(
 ) -> None:
     """Register one fusion family for `cls`.
 
-    This function updates the two global registries used by fused loading:
-    - the monkey-patching registry, so compatible module classes are replaced before initialization
-    - the checkpoint conversion mapping, so fused runtime modules still load from the original checkpoint layout
+    This function registers the two runtime changes used by fused loading:
+    - a monkey patch, so compatible module classes are replaced before initialization
+    - a checkpoint conversion mapping, so fused runtime modules still load from the original checkpoint layout
+
+    Inside `from_pretrained` those registrations belong to that load and are removed from the global
+    registries when the load ends. Outside a load they stay in the global registries.
 
     Notes:
     - conflicting checkpoint transforms fail fast

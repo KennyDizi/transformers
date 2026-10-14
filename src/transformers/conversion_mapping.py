@@ -33,6 +33,7 @@ from .core_model_loading import (
     WeightRenaming,
     WeightTransform,
 )
+from .registration_scope import conversion_key_registered_for_load, current_load_scope
 
 
 if TYPE_CHECKING:
@@ -2078,6 +2079,9 @@ def get_checkpoint_conversion_mapping(model_type):
     global _checkpoint_conversion_mapping_cache
     if _checkpoint_conversion_mapping_cache is None:
         _checkpoint_conversion_mapping_cache = _build_checkpoint_conversion_mapping()
+    scope = current_load_scope()
+    if scope is not None and model_type in scope.conversion_mappings:
+        return deepcopy(scope.conversion_mappings[model_type])
     return deepcopy(_checkpoint_conversion_mapping_cache.get(model_type))
 
 
@@ -2096,10 +2100,31 @@ def register_checkpoint_conversion_mapping(
     `extract_weight_conversions_for_model`), making it possible to define
     task-head-specific or class-specific conversions that differ from the shared
     `model_type` baseline.
+
+    Registrations made while [`~PreTrainedModel.from_pretrained`] is loading a model belong to
+    that load. They are discarded when the load returns, including when it fails. The loaded
+    model keeps those rules for later `get_model_conversion_mapping` calls. Calls made outside
+    a load stay in the global registry.
     """
     global _checkpoint_conversion_mapping_cache
     if _checkpoint_conversion_mapping_cache is None:
         _checkpoint_conversion_mapping_cache = _build_checkpoint_conversion_mapping()
+
+    scope = current_load_scope()
+    if scope is not None:
+        already_registered = (
+            model_type_or_class_name in scope.conversion_mappings
+            or model_type_or_class_name in _checkpoint_conversion_mapping_cache
+        )
+        if already_registered and not overwrite:
+            raise ValueError(
+                f"Conversion mapping for '{model_type_or_class_name}' already exists. Pass overwrite=True to replace it."
+            )
+        # Keep the global entry intact. This load reads the scoped list in its place.
+        scope.conversion_mappings[model_type_or_class_name] = mapping
+        scope.registered_conversion_keys.add(model_type_or_class_name)
+        return
+
     if model_type_or_class_name in _checkpoint_conversion_mapping_cache and not overwrite:
         raise ValueError(
             f"Conversion mapping for '{model_type_or_class_name}' already exists. Pass overwrite=True to replace it."
@@ -2107,6 +2132,31 @@ def register_checkpoint_conversion_mapping(
     _checkpoint_conversion_mapping_cache[model_type_or_class_name] = mapping
     # Keep track of what was added manually by the user
     USER_REGISTERED_MAPPINGS.add(model_type_or_class_name)
+
+
+def _conversion_key_visible(module, key: str | None) -> bool:
+    """Whether `key` was registered globally, by the active load, or stored on `module`."""
+    if key is None:
+        return False
+    if key in USER_REGISTERED_MAPPINGS or conversion_key_registered_for_load(key):
+        return True
+    stored = getattr(module, "_load_conversion_mappings", None)
+    return isinstance(stored, dict) and key in stored
+
+
+def _lookup_module_conversions(module, key: str | None) -> list[WeightTransform] | None:
+    """Return conversions for `key`, preferring rules captured on `module` during its load.
+
+    While a load is active and the model has not been stamped yet, the active scope is consulted
+    by `get_checkpoint_conversion_mapping`. After the load returns, only the copy stored on the
+    model still carries that load's rules, so a later lookup does not depend on the global registry.
+    """
+    if key is None:
+        return None
+    stored = getattr(module, "_load_conversion_mappings", None)
+    if isinstance(stored, dict) and key in stored:
+        return deepcopy(stored[key])
+    return get_checkpoint_conversion_mapping(key)
 
 
 def extract_weight_conversions_for_model(
@@ -2123,9 +2173,9 @@ def extract_weight_conversions_for_model(
     model_type = model.config.model_type
 
     # Class name takes priority — allows ForXxx-specific overrides
-    conversions = get_checkpoint_conversion_mapping(class_name)
+    conversions = _lookup_module_conversions(model, class_name)
     if conversions is None and model_type:
-        conversions = get_checkpoint_conversion_mapping(model_type)
+        conversions = _lookup_module_conversions(model, model_type)
     return conversions
 
 
@@ -2145,6 +2195,10 @@ def get_model_conversion_mapping(
     sub-module is processed, both its class name and `model_type` are marked
     seen to prevent `XForY` / `XModel` pairs from applying the same mapping
     twice via different lookup paths.
+
+    Conversions registered while `model` (or one of its sub-models) was loaded are read from
+    that module. They stay available after `from_pretrained` returns, for adapter loading,
+    quantized loading, and the save fallback, without remaining in the global registry.
     """
     from .modeling_utils import PreTrainedModel
 
@@ -2172,11 +2226,10 @@ def get_model_conversion_mapping(
         model_type = submodule.config.model_type
 
         # Skip it if it's custom code and it was NOT registered by the user directly: it may have the same `model_type`/ClassName
-        # as a native model inside the library, but it uses custom modeling so it should not share the conversions
-        if (
-            submodule.is_custom_code()
-            and class_name not in USER_REGISTERED_MAPPINGS
-            and model_type not in USER_REGISTERED_MAPPINGS
+        # as a native model inside the library, but it uses custom modeling so it should not share the conversions.
+        # Rules captured on this module by its own load count as registered for that module only.
+        if submodule.is_custom_code() and not (
+            _conversion_key_visible(submodule, class_name) or _conversion_key_visible(submodule, model_type)
         ):
             continue
 
@@ -2187,7 +2240,7 @@ def get_model_conversion_mapping(
         # Class name takes priority — a class-specific mapping bypasses the model_type
         # deduplication check (e.g. LlavaModel nested inside LlavaForConditionalGeneration
         # must still get its own scoped mapping even after "llava" is marked seen).
-        conversions = get_checkpoint_conversion_mapping(class_name)
+        conversions = _lookup_module_conversions(submodule, class_name)
         found_via_class = conversions is not None
 
         if not found_via_class:
@@ -2197,7 +2250,7 @@ def get_model_conversion_mapping(
             ):
                 continue
             if model_type is not None:
-                conversions = get_checkpoint_conversion_mapping(model_type)
+                conversions = _lookup_module_conversions(submodule, model_type)
 
         if conversions is None:
             continue

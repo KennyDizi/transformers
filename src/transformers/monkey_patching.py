@@ -17,6 +17,7 @@ import sys
 import threading
 from contextlib import contextmanager
 
+from .registration_scope import current_load_scope
 from .utils import is_torch_available, logging
 from .utils.output_capturing import OutputRecorder
 
@@ -133,9 +134,15 @@ def register_patch_mapping(mapping: dict[str, type[nn.Module]], overwrite: bool 
 
     Note:
         For weight conversions, use [`~transformers.register_checkpoint_conversion_mapping`] instead.
+
+        Registrations made while [`~PreTrainedModel.from_pretrained`] is loading a model belong to that
+        load. They are discarded when the load returns, including when it fails, and they do not replace
+        entries already stored in this global registry. Calls made outside a load stay here.
     """
     global _monkey_patch_mapping_cache
     with _monkey_patch_lock:
+        scope = current_load_scope()
+        target = scope.patch_mapping if scope is not None else _monkey_patch_mapping_cache
         for class_name, replacement_class in mapping.items():
             # Validate that replacement_class is actually a class and is a subclass of nn.Module
             if not isinstance(replacement_class, type):
@@ -148,11 +155,14 @@ def register_patch_mapping(mapping: dict[str, type[nn.Module]], overwrite: bool 
                     f"got {replacement_class.__name__} which inherits from {[c.__name__ for c in replacement_class.__mro__[1:]]}"
                 )
 
-            if class_name in _monkey_patch_mapping_cache and not overwrite:
+            already_registered = class_name in target or (
+                scope is not None and class_name in _monkey_patch_mapping_cache
+            )
+            if already_registered and not overwrite:
                 raise ValueError(
                     f"Class '{class_name}' already has a patch mapping registered. Use overwrite=True to replace it."
                 )
-            _monkey_patch_mapping_cache[class_name] = replacement_class
+            target[class_name] = replacement_class
 
 
 def unregister_patch_mapping(keys: list[str]) -> None:
@@ -186,7 +196,13 @@ def unregister_patch_mapping(keys: list[str]) -> None:
     """
     global _monkey_patch_mapping_cache
     with _monkey_patch_lock:
+        scope = current_load_scope()
         for key in keys:
+            # A load-scoped entry shadows a global one. Drop the shadow first so the global entry,
+            # which outlives the load, is only removed by an explicit unregister of that entry.
+            if scope is not None and key in scope.patch_mapping:
+                del scope.patch_mapping[key]
+                continue
             if key not in _monkey_patch_mapping_cache:
                 raise ValueError(
                     f"Class or pattern '{key}' not found in monkey patch mapping cache. "
@@ -203,7 +219,12 @@ def get_patch_mapping() -> dict[str, type[nn.Module]]:
         `Dict[str, type[nn.Module]]`: Dictionary mapping class names or patterns to replacement classes.
     """
     with _monkey_patch_lock:
-        return _monkey_patch_mapping_cache.copy()
+        mapping = _monkey_patch_mapping_cache.copy()
+        scope = current_load_scope()
+        if scope is not None:
+            # The active load shadows global entries for the same key without writing over them.
+            mapping.update(scope.patch_mapping)
+        return mapping
 
 
 def clear_patch_mapping() -> None:
@@ -235,7 +256,7 @@ def apply_patches():
     """
     Context manager to apply registered monkey patches within a block of code.
 
-    This temporarily replaces original classes with their registered replacements during the execution of the block, and restores the original classes afterward.
+    This temporarily replaces original classes with their registered replacements during the execution of the block, and restores the original classes afterward, including when the block raises.
 
     Example:
         ```python
@@ -262,39 +283,46 @@ def apply_patches():
         yield
         return
 
-    original_classes = {}
+    # Keep the module object itself. Keying by module name drops the real original when the same
+    # module object is seen twice, and a failed load must put those classes back.
+    originals: list[tuple[object, str, type]] = []
+    seen: set[tuple[int, str]] = set()
 
-    # Create list to avoid dict changed during iteration
-    for module in list(sys.modules.values()):
-        if module is None or not hasattr(module, "__name__"):
-            continue
-        if not module.__name__.startswith("transformers"):
-            continue
-
-        # Iterate through all attributes in transformers modules
-        for attr_name in dir(module):
-            # Check if this attribute name matches any pattern before accessing it
-            replacement_class = _find_replacement_class(attr_name, mapping)
-            if replacement_class is None:
+    try:
+        # Create list to avoid dict changed during iteration
+        for module in list(sys.modules.values()):
+            if module is None or not hasattr(module, "__name__"):
+                continue
+            if not module.__name__.startswith("transformers"):
                 continue
 
-            try:
-                attr = getattr(module, attr_name)
-                # Check if it's a class
-                if not isinstance(attr, type):
+            # Iterate through all attributes in transformers modules
+            for attr_name in dir(module):
+                # Check if this attribute name matches any pattern before accessing it
+                replacement_class = _find_replacement_class(attr_name, mapping)
+                if replacement_class is None:
                     continue
 
-                original_classes[(module.__name__, attr_name)] = attr
-                setattr(module, attr_name, replacement_class)
-            except (AttributeError, TypeError, ImportError):
-                # Skip attributes that can't be accessed or modules that can't be imported
-                continue
+                try:
+                    attr = getattr(module, attr_name)
+                    # Check if it's a class
+                    if not isinstance(attr, type) or attr is replacement_class:
+                        continue
 
-    yield
+                    identity = (id(module), attr_name)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    originals.append((module, attr_name, attr))
+                    setattr(module, attr_name, replacement_class)
+                except (AttributeError, TypeError, ImportError):
+                    # Skip attributes that can't be accessed or modules that can't be imported
+                    continue
 
-    for (module_name, class_name), original_class in original_classes.items():
-        module = sys.modules[module_name]
-        setattr(module, class_name, original_class)
+        yield
+    finally:
+        for module, class_name, original_class in reversed(originals):
+            setattr(module, class_name, original_class)
 
 
 # _can_record_outputs is a class attribute so patching and unpatching it in the class won't work

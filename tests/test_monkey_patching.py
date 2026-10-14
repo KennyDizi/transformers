@@ -173,6 +173,13 @@ class MonkeyPatchTest(unittest.TestCase):
             # Outside context again, original class should be restored
             self.assertEqual(test_module.Linear, nn.Linear)
 
+            # A failure inside the block must not leave the replacement in place.
+            with self.assertRaises(RuntimeError):
+                with apply_patches():
+                    self.assertEqual(test_module.Linear, CustomLinear)
+                    raise RuntimeError("patch failed")
+            self.assertEqual(test_module.Linear, nn.Linear)
+
         finally:
             # Clean up the test module
             del sys.modules["transformers.test_module"]
