@@ -204,6 +204,11 @@ AutoModel.register(ResnetConfig, ResnetModel)
 AutoModelForImageClassification.register(ResnetConfig, ResnetModelForImageClassification)
 ```
 
+> [!TIP]
+> Registering the same class object again is a no-op, so a cell that only repeats the `register` call is safe. A class
+> statement creates a new object. Registering that new object for an existing custom key raises `ValueError` unless you
+> pass `exist_ok=True`. Model types and configurations that ship with Transformers raise unless `exist_ok=True`.
+
 Your custom model code is now compatible with the [AutoClass](#autoclass) API. Users can load the model with the [AutoModel](./model_doc/auto) or [`AutoModelForImageClassification`] classes.
 
 ## Upload

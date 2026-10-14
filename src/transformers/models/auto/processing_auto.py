@@ -367,7 +367,7 @@ class AutoProcessor:
         )
 
     @staticmethod
-    def register(config_class, processor_class, exist_ok=False):
+    def register(config_class, processor_class, exist_ok: bool = False):
         """
         Register a new processor for this class.
 
@@ -375,6 +375,11 @@ class AutoProcessor:
             config_class ([`PreTrainedConfig`]):
                 The configuration corresponding to the model to register.
             processor_class ([`ProcessorMixin`]): The processor to register.
+            exist_ok (`bool`, *optional*, defaults to `False`):
+                Whether to replace an existing registration. Registering the same class object again is a no-op.
+                Registering a different class raises `ValueError` unless this is `True`. Configurations that ship with
+                Transformers raise unless this is `True`. Classes are compared by identity, so a class redefined in a
+                notebook counts as a new class.
         """
         PROCESSOR_MAPPING.register(config_class, processor_class, exist_ok=exist_ok)
 

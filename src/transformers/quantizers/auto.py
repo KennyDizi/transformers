@@ -16,6 +16,7 @@ import warnings
 
 from ..models.auto.configuration_auto import AutoConfig
 from ..utils import logging
+from ..utils.generic import _commit_registration
 from ..utils.quantization_config import (
     AqlmConfig,
     AutoRoundConfig,
@@ -149,6 +150,9 @@ LOADING_ATTRIBUTES_CONFIG_TYPES = (
 )
 
 logger = logging.get_logger(__name__)
+
+_BUILTIN_QUANTIZER_NAMES = frozenset(AUTO_QUANTIZER_MAPPING)
+_BUILTIN_QUANTIZATION_CONFIG_METHODS = frozenset(AUTO_QUANTIZATION_CONFIG_MAPPING)
 
 
 class AutoQuantizationConfig:
@@ -303,33 +307,63 @@ class AutoHfQuantizer:
         return True
 
 
-def register_quantization_config(method: str):
-    """Register a custom quantization configuration."""
+def register_quantization_config(method: str, exist_ok: bool = False):
+    """
+    Register a custom quantization configuration.
+
+    Registering the same class again for a custom method is a no-op. Registering a different class raises `ValueError`
+    naming the method and the new class unless `exist_ok=True`. Methods that ship with Transformers raise unless
+    `exist_ok=True`. Classes are compared by identity, so a class redefined in a notebook counts as a new class.
+
+    Args:
+        method (`str`):
+            The quantization method name.
+        exist_ok (`bool`, *optional*, defaults to `False`):
+            Whether to replace an existing registration.
+
+    Returns:
+        `Callable`: A decorator that registers the configuration class.
+    """
 
     def register_config_fn(cls):
-        if method in AUTO_QUANTIZATION_CONFIG_MAPPING:
-            raise ValueError(f"Config '{method}' already registered")
-
         if not issubclass(cls, QuantizationConfigMixin):
             raise TypeError("Config must extend QuantizationConfigMixin")
 
-        AUTO_QUANTIZATION_CONFIG_MAPPING[method] = cls
+        if method in _BUILTIN_QUANTIZATION_CONFIG_METHODS and not exist_ok:
+            raise ValueError(f"Config '{method}' already registered")
+
+        _commit_registration(AUTO_QUANTIZATION_CONFIG_MAPPING, method, cls, exist_ok=exist_ok)
         return cls
 
     return register_config_fn
 
 
-def register_quantizer(name: str):
-    """Register a custom quantizer."""
+def register_quantizer(name: str, exist_ok: bool = False):
+    """
+    Register a custom quantizer.
+
+    Registering the same class again for a custom name is a no-op. Registering a different class raises `ValueError`
+    naming the quantizer and the new class unless `exist_ok=True`. Quantizers that ship with Transformers raise unless
+    `exist_ok=True`. Classes are compared by identity, so a class redefined in a notebook counts as a new class.
+
+    Args:
+        name (`str`):
+            The quantizer name.
+        exist_ok (`bool`, *optional*, defaults to `False`):
+            Whether to replace an existing registration.
+
+    Returns:
+        `Callable`: A decorator that registers the quantizer class.
+    """
 
     def register_quantizer_fn(cls):
-        if name in AUTO_QUANTIZER_MAPPING:
-            raise ValueError(f"Quantizer '{name}' already registered")
-
         if not issubclass(cls, HfQuantizer):
             raise TypeError("Quantizer must extend HfQuantizer")
 
-        AUTO_QUANTIZER_MAPPING[name] = cls
+        if name in _BUILTIN_QUANTIZER_NAMES and not exist_ok:
+            raise ValueError(f"Quantizer '{name}' already registered")
+
+        _commit_registration(AUTO_QUANTIZER_MAPPING, name, cls, exist_ok=exist_ok)
         return cls
 
     return register_quantizer_fn

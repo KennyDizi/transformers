@@ -34,6 +34,7 @@ from ...utils import (
     requires_backends,
     resolve_revision,
 )
+from ...utils.generic import _commit_registration
 from .configuration_auto import AutoConfig, model_type_to_module_name, replace_list_option_in_docstrings
 
 
@@ -417,7 +418,7 @@ class _BaseAutoModelClass:
         )
 
     @classmethod
-    def register(cls, config_class, model_class, exist_ok=False) -> None:
+    def register(cls, config_class, model_class, exist_ok: bool = False) -> None:
         """
         Register a new model for this class.
 
@@ -426,6 +427,11 @@ class _BaseAutoModelClass:
                 The configuration corresponding to the model to register.
             model_class ([`PreTrainedModel`]):
                 The model to register.
+            exist_ok (`bool`, *optional*, defaults to `False`):
+                Whether to replace an existing registration. Registering the same class object again is a no-op.
+                Registering a different class raises `ValueError` unless this is `True`. Configurations that ship with
+                Transformers raise unless this is `True`. Classes are compared by identity, so a class redefined in a
+                notebook counts as a new class.
         """
         if hasattr(model_class, "config_class") and model_class.config_class.__name__ != config_class.__name__:
             raise ValueError(
@@ -671,9 +677,15 @@ class _LazyAutoMapping(OrderedDict[type[PreTrainedConfig], _LazyAutoMappingValue
         model_type = self._reverse_config_mapping[item.__name__]
         return model_type in self._model_mapping
 
-    def register(self, key: type[PreTrainedConfig] | str, value: _LazyAutoMappingValue, exist_ok=False) -> None:
+    def register(
+        self, key: type[PreTrainedConfig] | str, value: _LazyAutoMappingValue, exist_ok: bool = False
+    ) -> None:
         """
         Register a new model in this mapping.
+
+        A configuration that ships with Transformers raises unless `exist_ok` is true. For a custom configuration,
+        registering the same class object again is a no-op, and registering a different class raises `ValueError`
+        unless `exist_ok` is true. Classes are compared by identity.
         """
         if hasattr(key, "__name__") and key.__name__ in self._reverse_config_mapping:
             model_type = self._reverse_config_mapping[key.__name__]
@@ -690,7 +702,7 @@ class _LazyAutoMapping(OrderedDict[type[PreTrainedConfig], _LazyAutoMappingValue
             return
 
         # Register the new mapping (this will always take precedence in __getattr__ and __contains__ compared to base mapping)
-        self._extra_content[key] = value
+        _commit_registration(self._extra_content, key, value, exist_ok=exist_ok)
 
     def __reduce__(self):
         return (

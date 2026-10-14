@@ -117,6 +117,13 @@ PIPELINE_REGISTRY.register_pipeline(
 )
 ```
 
+> [!WARNING]
+> Registering a task that ships with Transformers, such as `"text-classification"`, raises `ValueError` unless you pass
+> `exist_ok=True`. This used to log a warning and overwrite the built-in task. For a custom task, registering the same
+> pipeline class again does nothing. Registering a different class raises `ValueError` naming the task and the new class
+> unless you pass `exist_ok=True`. Classes are compared by identity: re-running a cell that defines the class again
+> creates a new class, and that call needs `exist_ok=True`.
+
 ## Share your pipeline
 
 Share your pipeline with the community on the [Hub](https://hf.co) or you can add it directly to Transformers.

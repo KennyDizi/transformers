@@ -479,17 +479,22 @@ class AutoVideoProcessor:
                 Dictionary mapping backend names to video processor classes. Allows registering custom backends.
                 Example: `{"pil": MyPilVideoProcessor, "torchvision": MyTorchvisionVideoProcessor, "custom": MyCustomVideoProcessor}`
             exist_ok (`bool`, *optional*, defaults to `False`):
-                If `True`, allow overwriting existing registrations.
+                Whether to replace an existing registration. Registering the same class object again is a no-op.
+                Replacing a backend with a different class raises `ValueError` unless this is `True`. Adding a new
+                backend keeps the classes already registered. Configurations that ship with Transformers raise unless
+                this is `True`. Classes are compared by identity, so a class redefined in a notebook counts as a new
+                class.
         """
         if video_processor_classes is None:
             # Legacy registering would pass a single torch-based class
             video_processor_classes = {"torchvision": video_processor_class}
 
-        # Avoid resetting existing processors if we are passing partial updates
+        # Keep backends that were already registered. Copy first so a rejected class replacement
+        # cannot mutate the stored mapping.
         if config_class in VIDEO_PROCESSOR_MAPPING:
             existing_mapping = VIDEO_PROCESSOR_MAPPING[config_class]
-            existing_mapping.update(video_processor_classes)
-            video_processor_classes = existing_mapping
+            if isinstance(existing_mapping, dict):
+                video_processor_classes = {**existing_mapping, **video_processor_classes}
 
         VIDEO_PROCESSOR_MAPPING.register(config_class, video_processor_classes, exist_ok=exist_ok)
 

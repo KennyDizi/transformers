@@ -378,7 +378,7 @@ class AutoFeatureExtractor:
         )
 
     @staticmethod
-    def register(config_class, feature_extractor_class, exist_ok=False):
+    def register(config_class, feature_extractor_class, exist_ok: bool = False):
         """
         Register a new feature extractor for this class.
 
@@ -386,6 +386,11 @@ class AutoFeatureExtractor:
             config_class ([`PreTrainedConfig`]):
                 The configuration corresponding to the model to register.
             feature_extractor_class ([`FeatureExtractorMixin`]): The feature extractor to register.
+            exist_ok (`bool`, *optional*, defaults to `False`):
+                Whether to replace an existing registration. Registering the same class object again is a no-op.
+                Registering a different class raises `ValueError` unless this is `True`. Configurations that ship with
+                Transformers raise unless this is `True`. Classes are compared by identity, so a class redefined in a
+                notebook counts as a new class.
         """
         FEATURE_EXTRACTOR_MAPPING.register(config_class, feature_extractor_class, exist_ok=exist_ok)
 

@@ -53,6 +53,7 @@ from ..utils import (
     logging,
 )
 from ..utils.chat_template_utils import Chat, is_valid_message
+from ..utils.generic import _resolve_custom_registration
 from ..video_processing_utils import BaseVideoProcessor
 
 
@@ -1365,6 +1366,7 @@ class PipelineRegistry:
     def __init__(self, supported_tasks: dict[str, Any], task_aliases: dict[str, str]) -> None:
         self.supported_tasks = supported_tasks
         self.task_aliases = task_aliases
+        self._builtin_tasks = set(supported_tasks)
 
     def get_supported_tasks(self) -> list[str]:
         supported_task = list(self.supported_tasks.keys()) + list(self.task_aliases.keys())
@@ -1387,9 +1389,43 @@ class PipelineRegistry:
         pt_model: type | tuple[type] | None = None,
         default: dict | None = None,
         type: str | None = None,
+        exist_ok: bool = False,
     ) -> None:
-        if task in self.supported_tasks:
-            logger.warning(f"{task} is already registered. Overwriting pipeline for task {task}...")
+        """
+        Register a pipeline for `task`.
+
+        Registering the same pipeline class again for a custom task is a no-op. Registering a different class raises
+        `ValueError` naming the task and the new class unless `exist_ok=True`, which replaces the entry. Classes are
+        compared by identity, so a class redefined in a notebook counts as a new class.
+
+        Tasks that ship with Transformers are protected. Overriding one, such as `"text-classification"`, raises
+        `ValueError` unless `exist_ok=True`. This used to log a warning and overwrite the built-in task.
+
+        Args:
+            task (`str`):
+                The task name to register.
+            pipeline_class (`type`):
+                The pipeline class to register.
+            pt_model (`type` or `tuple[type]`, *optional*):
+                The model class or classes this pipeline accepts.
+            default (`dict`, *optional*):
+                The default model checkpoint for this task.
+            type (`str`, *optional*):
+                The expected input type, for example `"text"` or `"audio"`.
+            exist_ok (`bool`, *optional*, defaults to `False`):
+                Whether to replace an existing registration, including a task that ships with Transformers.
+        """
+        if task in self._builtin_tasks and not exist_ok:
+            raise ValueError(
+                f"'{task}' is already used by a Transformers pipeline, pick another name. "
+                f"Pass exist_ok=True to replace it with {pipeline_class}."
+            )
+        if task in self.supported_tasks and task not in self._builtin_tasks:
+            write, _ = _resolve_custom_registration(
+                task, self.supported_tasks[task]["impl"], pipeline_class, exist_ok=exist_ok
+            )
+            if not write:
+                return
 
         if pt_model is None:
             pt_model = ()

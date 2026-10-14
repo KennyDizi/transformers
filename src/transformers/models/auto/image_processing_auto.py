@@ -742,7 +742,11 @@ class AutoImageProcessor:
                 Dictionary mapping backend names to image processor classes. Allows registering custom backends.
                 Example: `{"pil": MyPilProcessor, "torchvision": MyTorchvisionProcessor, "custom": MyCustomProcessor}`
             exist_ok (`bool`, *optional*, defaults to `False`):
-                If `True`, allow overwriting existing registrations.
+                Whether to replace an existing registration. Registering the same class object again is a no-op.
+                Replacing a backend with a different class raises `ValueError` unless this is `True`. Adding a new
+                backend keeps the classes already registered. Configurations that ship with Transformers raise unless
+                this is `True`. Classes are compared by identity, so a class redefined in a notebook counts as a new
+                class.
         """
         # Handle backward compatibility: convert old parameters to new format
         if image_processor_classes is None:
@@ -759,11 +763,12 @@ class AutoImageProcessor:
                 "`slow_image_processor_class`/`fast_image_processor_class` parameters."
             )
 
-        # Avoid resetting existing processors if we are passing partial updates
+        # Keep backends that were already registered. Copy first so a rejected class replacement
+        # cannot mutate the stored mapping.
         if config_class in IMAGE_PROCESSOR_MAPPING:
             existing_mapping = IMAGE_PROCESSOR_MAPPING[config_class]
-            existing_mapping.update(image_processor_classes)
-            image_processor_classes = existing_mapping
+            if isinstance(existing_mapping, dict):
+                image_processor_classes = {**existing_mapping, **image_processor_classes}
 
         # Validate that all classes are proper image processor classes
         from ...image_processing_utils import BaseImageProcessor

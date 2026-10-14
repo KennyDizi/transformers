@@ -23,6 +23,7 @@ from typing import Any, TypeVar
 from ...configuration_utils import PreTrainedConfig
 from ...dynamic_module_utils import get_class_from_dynamic_module, resolve_trust_remote_code
 from ...utils import CONFIG_NAME, logging, resolve_revision
+from ...utils.generic import _commit_registration
 from .auto_mappings import CONFIG_MAPPING_NAMES, SPECIAL_MODEL_TYPE_TO_MODULE_NAME
 
 
@@ -132,13 +133,17 @@ class _LazyConfigMapping(OrderedDict[str, type[PreTrainedConfig]]):
     def __contains__(self, item: object) -> bool:
         return item in self._mapping or item in self._extra_content
 
-    def register(self, key: str, value: type[PreTrainedConfig], exist_ok=False) -> None:
+    def register(self, key: str, value: type[PreTrainedConfig], exist_ok: bool = False) -> None:
         """
         Register a new configuration in this mapping.
+
+        A model type that ships with Transformers raises unless `exist_ok` is true. For a custom model type,
+        registering the same config class again is a no-op, and registering a different class raises `ValueError`
+        unless `exist_ok` is true. Classes are compared by identity.
         """
         if key in self._mapping and not exist_ok:
             raise ValueError(f"'{key}' is already used by a Transformers config, pick another name.")
-        self._extra_content[key] = value
+        _commit_registration(self._extra_content, key, value, exist_ok=exist_ok)
 
     def __reduce__(self):
         return (self.__class__._from_pickle, (dict(self._mapping), dict(self._extra_content)))
@@ -445,13 +450,18 @@ class AutoConfig:
         )
 
     @staticmethod
-    def register(model_type, config, exist_ok=False) -> None:
+    def register(model_type, config, exist_ok: bool = False) -> None:
         """
         Register a new configuration for this class.
 
         Args:
             model_type (`str`): The model type like "bert" or "gpt".
             config ([`PreTrainedConfig`]): The config to register.
+            exist_ok (`bool`, *optional*, defaults to `False`):
+                Whether to replace an existing registration. Registering the same class object again is a no-op.
+                Registering a different class raises `ValueError` unless this is `True`. Model types that ship with
+                Transformers raise unless this is `True`. Classes are compared by identity, so a class redefined in a
+                notebook counts as a new class.
         """
         if issubclass(config, PreTrainedConfig) and config.model_type != model_type:
             raise ValueError(

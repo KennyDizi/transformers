@@ -60,6 +60,9 @@ logger = logging.get_logger(__name__)
 # V5: Simplified mapping - single tokenizer class per model type (always prefer tokenizers-based)
 REGISTERED_TOKENIZER_CLASSES: dict[str, type[Any]] = {}
 REGISTERED_FAST_ALIASES: dict[str, type[Any]] = {}
+# Config classes whose current extra-mapping entry was registered as a slow tokenizer and may be
+# replaced by a later fast registration without exist_ok.
+_SLOW_TOKENIZER_REGISTRATIONS: dict[Any, Any] = {}
 
 TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
     [
@@ -1001,7 +1004,11 @@ class AutoTokenizer:
 
     @staticmethod
     def register(
-        config_class, tokenizer_class=None, slow_tokenizer_class=None, fast_tokenizer_class=None, exist_ok=False
+        config_class,
+        tokenizer_class=None,
+        slow_tokenizer_class=None,
+        fast_tokenizer_class=None,
+        exist_ok: bool = False,
     ):
         """
         Register a new tokenizer in this mapping.
@@ -1012,6 +1019,12 @@ class AutoTokenizer:
             tokenizer_class: The tokenizer class to register (V5 - preferred parameter).
             slow_tokenizer_class: (Deprecated) The slow tokenizer to register.
             fast_tokenizer_class: (Deprecated) The fast tokenizer to register.
+            exist_ok (`bool`, *optional*, defaults to `False`):
+                Whether to replace an existing registration. Registering the same class object again is a no-op.
+                Registering a different class raises `ValueError` unless this is `True`. Configurations that ship with
+                Transformers raise unless this is `True`. Classes are compared by identity, so a class redefined in a
+                notebook counts as a new class. Registering a slow tokenizer and then its fast tokenizer still
+                replaces the slow class with the fast one.
         """
         if tokenizer_class is None:
             # Legacy: prefer fast over slow
@@ -1022,6 +1035,21 @@ class AutoTokenizer:
             else:
                 raise ValueError("You need to pass a `tokenizer_class`")
 
+        extra = TOKENIZER_MAPPING._extra_content
+        registered_slow = _SLOW_TOKENIZER_REGISTRATIONS.get(config_class)
+        if registered_slow is not None and extra.get(config_class) is not registered_slow:
+            _SLOW_TOKENIZER_REGISTRATIONS.pop(config_class, None)
+            registered_slow = None
+        # Slow-then-fast is one registration done in two calls: the fast class replaces the slow one.
+        slow_then_fast = (
+            fast_tokenizer_class is not None
+            and tokenizer_class is fast_tokenizer_class
+            and registered_slow is not None
+            and extra.get(config_class) is registered_slow
+        )
+
+        TOKENIZER_MAPPING.register(config_class, tokenizer_class, exist_ok=exist_ok or slow_then_fast)
+
         for candidate in (slow_tokenizer_class, fast_tokenizer_class, tokenizer_class):
             if candidate is not None:
                 REGISTERED_TOKENIZER_CLASSES[candidate.__name__] = candidate
@@ -1029,7 +1057,10 @@ class AutoTokenizer:
         if slow_tokenizer_class is not None and fast_tokenizer_class is not None:
             REGISTERED_FAST_ALIASES[slow_tokenizer_class.__name__] = fast_tokenizer_class
 
-        TOKENIZER_MAPPING.register(config_class, tokenizer_class, exist_ok=exist_ok)
+        if extra.get(config_class) is tokenizer_class and tokenizer_class is slow_tokenizer_class:
+            _SLOW_TOKENIZER_REGISTRATIONS[config_class] = slow_tokenizer_class
+        elif extra.get(config_class) is tokenizer_class:
+            _SLOW_TOKENIZER_REGISTRATIONS.pop(config_class, None)
 
 
 __all__ = ["TOKENIZER_MAPPING", "AutoTokenizer"]

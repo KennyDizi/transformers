@@ -42,7 +42,6 @@ from transformers.pipelines.base import Pipeline, _pad
 from transformers.testing_utils import (
     TOKEN,
     USER,
-    CaptureLogger,
     RequestCounter,
     backend_empty_cache,
     is_pipeline_test,
@@ -56,7 +55,6 @@ from transformers.testing_utils import (
     torch_device,
 )
 from transformers.utils import direct_transformers_import, is_torch_available
-from transformers.utils import logging as transformers_logging
 from transformers.utils.chat_template_utils import Chat
 
 
@@ -885,21 +883,63 @@ class CustomPipeline(Pipeline):
 @is_pipeline_test
 class CustomPipelineTest(unittest.TestCase):
     def test_warning_logs(self):
-        transformers_logging.set_verbosity_debug()
-        logger_ = transformers_logging.get_logger("transformers.pipelines.base")
-
+        # Built-in tasks used to log a warning and be overwritten. Overriding one now raises unless exist_ok=True.
         alias = "text-classification"
         # Get the original task, so we can restore it at the end.
         # (otherwise the subsequential tests in `TextClassificationPipelineTests` will fail)
         _, original_task, _ = PIPELINE_REGISTRY.check_task(alias)
 
         try:
-            with CaptureLogger(logger_) as cm:
+            with self.assertRaisesRegex(ValueError, "text-classification") as ctx:
                 PIPELINE_REGISTRY.register_pipeline(alias, PairClassificationPipeline)
-            self.assertIn(f"{alias} is already registered", cm.out)
+            self.assertIn("already used by a Transformers pipeline", str(ctx.exception))
+            self.assertIn(PairClassificationPipeline.__name__, str(ctx.exception))
+            _, unchanged, _ = PIPELINE_REGISTRY.check_task(alias)
+            self.assertEqual(unchanged["impl"], original_task["impl"])
+
+            # The same built-in class is not a free re-registration either.
+            with self.assertRaisesRegex(ValueError, "already used by a Transformers pipeline"):
+                PIPELINE_REGISTRY.register_pipeline(alias, original_task["impl"])
+
+            PIPELINE_REGISTRY.register_pipeline(alias, PairClassificationPipeline, exist_ok=True)
+            _, overridden, _ = PIPELINE_REGISTRY.check_task(alias)
+            self.assertIs(overridden["impl"], PairClassificationPipeline)
         finally:
             # restore
             PIPELINE_REGISTRY.supported_tasks[alias] = original_task
+
+    def test_custom_pipeline_registration_collision(self):
+        class OtherPipeline(PairClassificationPipeline):
+            pass
+
+        def make_pipeline():
+            class RedefinedPipeline(PairClassificationPipeline):
+                pass
+
+            return RedefinedPipeline
+
+        task = "custom-registration-collision"
+        try:
+            PIPELINE_REGISTRY.register_pipeline(task, pipeline_class=PairClassificationPipeline, type="text")
+            stored = PIPELINE_REGISTRY.supported_tasks[task]
+            # Same class object is a no-op, including when other fields differ.
+            PIPELINE_REGISTRY.register_pipeline(task, pipeline_class=PairClassificationPipeline, type="audio")
+            self.assertIs(PIPELINE_REGISTRY.supported_tasks[task], stored)
+            self.assertEqual(stored["type"], "text")
+
+            with self.assertRaisesRegex(ValueError, "OtherPipeline"):
+                PIPELINE_REGISTRY.register_pipeline(task, pipeline_class=OtherPipeline)
+            self.assertIs(PIPELINE_REGISTRY.supported_tasks[task]["impl"], PairClassificationPipeline)
+
+            redefined = make_pipeline()
+            with self.assertRaisesRegex(ValueError, "RedefinedPipeline"):
+                PIPELINE_REGISTRY.register_pipeline(task, pipeline_class=redefined)
+
+            PIPELINE_REGISTRY.register_pipeline(task, pipeline_class=OtherPipeline, type="text", exist_ok=True)
+            self.assertIs(PIPELINE_REGISTRY.supported_tasks[task]["impl"], OtherPipeline)
+            self.assertEqual(PIPELINE_REGISTRY.supported_tasks[task]["type"], "text")
+        finally:
+            PIPELINE_REGISTRY.supported_tasks.pop(task, None)
 
     def test_register_pipeline(self):
         PIPELINE_REGISTRY.register_pipeline(

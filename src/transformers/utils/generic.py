@@ -1107,6 +1107,86 @@ def no_inherit_decorator(obj: T) -> T:
     return obj
 
 
+def _same_registered_value(existing: Any, new: Any) -> bool:
+    """Whether two registrations point at the same class object(s).
+
+    Comparison is by identity. A class redefined in a notebook is a new object even when its name matches.
+    Containers match only when every nested class object matches.
+    """
+    if existing is new:
+        return True
+    if isinstance(existing, dict) and isinstance(new, dict):
+        if existing.keys() != new.keys():
+            return False
+        return all(_same_registered_value(existing[key], new[key]) for key in existing)
+    if isinstance(existing, tuple) and isinstance(new, tuple):
+        return len(existing) == len(new) and all(
+            _same_registered_value(left, right) for left, right in zip(existing, new)
+        )
+    return False
+
+
+def _registration_conflict_message(key: Any, new: Any, existing: Any) -> str:
+    return (
+        f"{key!r} is already registered to {existing} and cannot be overwritten with {new}. "
+        "Pass exist_ok=True to replace it."
+    )
+
+
+def _resolve_custom_registration(key: Any, existing: Any, new: Any, *, exist_ok: bool) -> tuple[bool, Any]:
+    """Decide what to store for a custom key that is already taken.
+
+    Returns `(write, value)`. `write` is false when the call is a no-op. Dict entries merge by key:
+    a new key is added, and replacing a class object follows the same identity rule as a bare class.
+    Callers reject built-in keys before calling this.
+    """
+    if isinstance(existing, dict) and isinstance(new, dict):
+        merged = dict(existing)
+        changed = False
+        for item_key, new_item in new.items():
+            if item_key not in merged:
+                merged[item_key] = new_item
+                changed = True
+                continue
+            old_item = merged[item_key]
+            if old_item is None:
+                if new_item is not None:
+                    merged[item_key] = new_item
+                    changed = True
+                continue
+            if _same_registered_value(old_item, new_item):
+                continue
+            if not exist_ok:
+                raise ValueError(_registration_conflict_message(f"{key}[{item_key!r}]", new_item, old_item))
+            merged[item_key] = new_item
+            changed = True
+        if not changed:
+            return False, existing
+        return True, merged
+
+    if _same_registered_value(existing, new):
+        if exist_ok:
+            return True, new
+        return False, existing
+    if not exist_ok:
+        raise ValueError(_registration_conflict_message(key, new, existing))
+    return True, new
+
+
+def _commit_registration(registry: dict[Any, Any], key: Any, value: Any, *, exist_ok: bool) -> None:
+    """Insert or replace `value` under the custom-key rule.
+
+    The same class object is a no-op. A different class object raises `ValueError` naming the key and the new
+    class unless `exist_ok` is true. Built-in keys are the caller's responsibility.
+    """
+    if key not in registry:
+        registry[key] = value
+        return
+    write, updated = _resolve_custom_registration(key, registry[key], value, exist_ok=exist_ok)
+    if write:
+        registry[key] = updated
+
+
 class GeneralInterface(MutableMapping):
     """
     Dict-like object keeping track of a class-wide mapping, as well as a local one. Allows to have library-wide
