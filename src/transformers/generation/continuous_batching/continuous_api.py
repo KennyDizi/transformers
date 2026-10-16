@@ -345,8 +345,7 @@ class ContinuousBatchProcessor:
         self.scheduler = scheduler
         self.distributed_helper = distributed_helper
 
-        # Generation-related attributes
-        self.do_sample = getattr(generation_config, "do_sample", True)
+        # Generation-related attributes. do_sample is stored on each request, not on the processor.
         self.return_logprobs = continuous_batching_config.return_logprobs
 
         # Get an integer seed for the TP group. Also work for no TP.
@@ -389,7 +388,6 @@ class ContinuousBatchProcessor:
             cb_config=self.cb_config,
             cache=self.cache,
             inputs_and_outputs=self.inputs_and_outputs,
-            do_sample=self.do_sample,
             return_logprobs=self.return_logprobs,
         )
 
@@ -654,6 +652,33 @@ class ContinuousBatchProcessor:
         self.model_runner.warmup(model)
 
 
+def _default_sampling_warper_values(generation_config: GenerationConfig) -> tuple[float, int, float]:
+    """Temperature, top-k, and top-p defaults for per-request warpers.
+
+    Non-positive temperature and an unset or non-positive top-k fall back to a no-op (temperature 1, top-k disabled).
+    Top-p outside `[0, 1]` falls back to 1. These match "no warper" numerically while still letting a later request
+    override the manager's values.
+    """
+    temperature = generation_config.temperature
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or float(temperature) <= 0:
+        temperature_value = 1.0
+    else:
+        temperature_value = float(temperature)
+
+    top_k = generation_config.top_k
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+        top_k_value = 0
+    else:
+        top_k_value = top_k
+
+    top_p = generation_config.top_p
+    if isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or not 0.0 <= float(top_p) <= 1.0:
+        top_p_value = 1.0
+    else:
+        top_p_value = float(top_p)
+    return temperature_value, top_k_value, top_p_value
+
+
 # Manager Class (User Interface)
 class ContinuousBatchingManager:
     """Manager for handling continuous batching of generation requests. It provides a user interface for submitting
@@ -722,6 +747,11 @@ class ContinuousBatchingManager:
             per_request_processors=continuous_batching_config.per_request_processors,
             drop_unsupported_processors=continuous_batching_config.drop_unsupported_processors,
         )
+        # With per-request processors, temperature / top-k / top-p exist even when this config would not have created
+        # them (greedy init, temperature 1, top_p 1, top_k unset). Requests then override the manager defaults.
+        if continuous_batching_config.per_request_processors:
+            temperature, top_k, top_p = _default_sampling_warper_values(generation_config)
+            self.logit_processor.ensure_request_sampling_defaults(temperature=temperature, top_k=top_k, top_p=top_p)
 
         # Fully resolve the continuous batching config now that we have the model, the config and the logit processor
         self.continuous_batching_config = resolve_continuous_batching_config(
@@ -910,6 +940,7 @@ class ContinuousBatchingManager:
         streaming: bool = False,
         record_timestamps: bool = False,
         eos_token_id: int | list[int] | None = None,
+        do_sample: bool | None = None,
         **logit_processor_kwargs: Any,
     ) -> str | None:
         """Add a new generation request to the queue. If the process is not a TP driver, this is a no-op.
@@ -921,7 +952,11 @@ class ContinuousBatchingManager:
             streaming: Whether to stream tokens as they're generated
             record_timestamps: Whether to record timestamps for each generated token
             eos_token_id: End-of-sequence token ID(s)
-            logit_processor_kwargs: Keyword arguments for the logits processor.
+            do_sample: Whether this request samples. `None` uses the manager generation config (`None` or `False`
+                there means greedy). Greedy and sampled requests can share a batch.
+            logit_processor_kwargs: Per-request logits-processor values, such as `temperature`, `top_p`, and `top_k`.
+                Omitted values use whatever the manager was initialized with. The keys must belong to processors that
+                exist on the manager (`per_request_processors=True` installs temperature, top-k, and top-p).
 
         Returns:
             str | None: The request ID if the process is a TP driver, None otherwise.
@@ -942,6 +977,11 @@ class ContinuousBatchingManager:
                 self._request_counter += 1
         max_new_tokens = self.generation_config.max_new_tokens if max_new_tokens is None else max_new_tokens
         eos_token_id = self.generation_config.eos_token_id if eos_token_id is None else eos_token_id
+        # Unset do_sample on the manager config means greedy, matching GenerationConfig's generate() default.
+        if do_sample is None:
+            do_sample = bool(self.generation_config.do_sample)
+        else:
+            do_sample = bool(do_sample)
 
         # NOTE: do we want to handle a case when the user wants token ids returned instead of decoded text?
         state = RequestState(
@@ -953,6 +993,7 @@ class ContinuousBatchingManager:
             eos_token_id=eos_token_id,
             streaming=streaming,
             logit_processor_kwargs=logit_processor_kwargs,
+            do_sample=do_sample,
         )
 
         # Use block=True with timeout to handle backpressure if queue is full

@@ -453,6 +453,175 @@ class TestBuildGenerationConfig(unittest.TestCase):
         result = self._make_handler()._build_generation_config({"max_tokens": 50}, GenerationConfig(max_new_tokens=20))
         self.assertEqual(result.max_new_tokens, 50)
 
+    def test_temperature_above_zero_enables_sampling(self):
+        from transformers import GenerationConfig
+
+        result = self._make_handler()._build_generation_config({"temperature": 0.7}, GenerationConfig(do_sample=False))
+        self.assertTrue(result.do_sample)
+        self.assertAlmostEqual(result.temperature, 0.7)
+
+    def test_cb_rejects_params_that_would_be_dropped(self):
+        from fastapi import HTTPException
+
+        from transformers import GenerationConfig
+
+        handler = self._make_handler()
+        for body in ({"frequency_penalty": 0.5}, {"logit_bias": {"42": 1.0}}, {"stop": ["END"]}):
+            with self.subTest(body=body):
+                with self.assertRaises(HTTPException) as ctx:
+                    handler._build_generation_config(body, GenerationConfig(), use_cb=True)
+                self.assertEqual(ctx.exception.status_code, 400)
+                self.assertIn(next(iter(body)), ctx.exception.detail)
+
+    def test_cb_allows_noop_frequency_penalty_and_empty_stop(self):
+        from transformers import GenerationConfig
+
+        result = self._make_handler()._build_generation_config(
+            {"frequency_penalty": 0.0, "stop": [], "logit_bias": {}}, GenerationConfig(), use_cb=True
+        )
+        self.assertAlmostEqual(result.repetition_penalty, 1.0)
+        self.assertEqual(result.stop_strings, [])
+        self.assertEqual(result.sequence_bias, {})
+
+    def test_completion_cb_rejects_stop_and_frequency_penalty(self):
+        from fastapi import HTTPException
+
+        from transformers import GenerationConfig
+
+        handler = CompletionHandler(model_manager=MagicMock(), generation_state=GenerationState())
+        with self.assertRaises(HTTPException) as ctx:
+            handler._build_generation_config(
+                {"stop": "END", "frequency_penalty": 0.2}, GenerationConfig(), use_cb=True
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("stop", ctx.exception.detail)
+        self.assertIn("frequency_penalty", ctx.exception.detail)
+
+    def test_cb_rejects_generation_config_json_penalty_bias_and_stop(self):
+        from fastapi import HTTPException
+
+        from transformers import GenerationConfig
+
+        custom = GenerationConfig(repetition_penalty=1.2, stop_strings=["END"], sequence_bias={(1,): 1.0})
+        with self.assertRaises(HTTPException) as ctx:
+            self._make_handler()._build_generation_config(
+                {"generation_config": custom.to_json_string()}, GenerationConfig(), use_cb=True
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("repetition_penalty", ctx.exception.detail)
+        self.assertIn("stop_strings", ctx.exception.detail)
+        self.assertIn("sequence_bias", ctx.exception.detail)
+
+
+@require_serve
+class TestCBPerRequestSampling(unittest.TestCase):
+    """Greedy and sampled requests share one continuous-batching server batch."""
+
+    def test_mixed_requests_follow_their_own_sampling_params(self):
+        asyncio.run(self._mixed_requests_follow_their_own_sampling_params())
+
+    async def _mixed_requests_follow_their_own_sampling_params(self):
+        from unittest.mock import patch
+
+        from transformers import ContinuousBatchingConfig, GenerationConfig, LlamaConfig, LlamaForCausalLM
+        from transformers.cli.serving.utils import CBGenerateManager
+        from transformers.generation.continuous_batching.continuous_api import ContinuousBatchingManager
+        from transformers.generation.continuous_batching.model_runner import ModelRunner
+
+        config = LlamaConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            attn_implementation="sdpa",
+            bos_token_id=1,
+            eos_token_id=1,
+            pad_token_id=0,
+            tie_word_embeddings=False,
+        )
+        model = LlamaForCausalLM(config).eval()
+        # Uniform logits: greedy decoding is token 0 on every step, sampling is not.
+        model.lm_head.weight.data.zero_()
+
+        cb_config = ContinuousBatchingConfig(
+            num_blocks=8,
+            page_size=16,
+            max_batch_tokens=32,
+            max_requests_per_batch=4,
+            use_cuda_graph=False,
+            use_async_batching=False,
+            auto_switch_to_flash=False,
+            allow_block_sharing=False,
+            seed=0,
+        )
+        manager = CBGenerateManager(cb_config=cb_config)
+        # The first request is greedy. The loop is held until both requests are queued.
+        with patch.object(ContinuousBatchingManager, "start", lambda self: None):
+            manager.init_cb(model, GenerationConfig(do_sample=False, max_new_tokens=6, eos_token_id=-1))
+        cb = manager._cb
+        self.assertIsNotNone(cb)
+        assert cb is not None
+        self.assertFalse(cb.is_running())
+
+        class _Processor:
+            def decode(self, generated_ids, skip_special_tokens=True):
+                return " ".join(str(int(token)) for token in generated_ids)
+
+        greedy_config = GenerationConfig(do_sample=False, max_new_tokens=6, eos_token_id=-1)
+        sampled_config = GenerationConfig(
+            do_sample=True, temperature=2.0, top_p=0.9, top_k=4, max_new_tokens=6, eos_token_id=-1
+        )
+        records: list[tuple[list[int], list[int]]] = []
+        original_sample = ModelRunner._sample
+
+        def wrapped_sample(runner, scores, output_ids, do_sample):
+            num_rows = scores.shape[1]
+            mask = [int(value) for value in do_sample[:num_rows].detach().cpu().tolist()]
+            original_sample(runner, scores, output_ids, do_sample)
+            records.append((mask, output_ids[0, :num_rows].detach().cpu().tolist()))
+
+        try:
+            with patch.object(ModelRunner, "_sample", wrapped_sample):
+                greedy_task = asyncio.create_task(
+                    manager.generate_non_streaming(
+                        model, _Processor(), {"input_ids": [1, 2, 3, 4]}, greedy_config, "greedy"
+                    )
+                )
+                sampled_task = asyncio.create_task(
+                    manager.generate_non_streaming(
+                        model, _Processor(), {"input_ids": [5, 6, 7, 8]}, sampled_config, "sampled"
+                    )
+                )
+                for _ in range(50):
+                    if cb.input_queue.qsize() >= 2:
+                        break
+                    await asyncio.sleep(0)
+                self.assertGreaterEqual(
+                    cb.input_queue.qsize(), 2, "both requests must be queued before the loop starts"
+                )
+                queued = {state.request_id: state for state in list(cb.input_queue.queue)}
+                self.assertEqual(set(queued), {"greedy", "sampled"})
+                self.assertFalse(queued["greedy"].do_sample)
+                self.assertNotIn("temperature", queued["greedy"].logit_processor_kwargs)
+                self.assertTrue(queued["sampled"].do_sample)
+                self.assertEqual(queued["sampled"].logit_processor_kwargs["temperature"], 2.0)
+                self.assertEqual(queued["sampled"].logit_processor_kwargs["top_p"], 0.9)
+                self.assertEqual(queued["sampled"].logit_processor_kwargs["top_k"], 4)
+
+                cb.start()
+                greedy_out, sampled_out = await asyncio.wait_for(asyncio.gather(greedy_task, sampled_task), timeout=60)
+        finally:
+            manager.stop()
+
+        _, _, greedy_ids = greedy_out
+        _, _, sampled_ids = sampled_out
+        self.assertEqual(list(greedy_ids), [0] * 6)
+        self.assertNotEqual(list(sampled_ids), [0] * 6)
+        self.assertTrue(any(0 in mask and 1 in mask for mask, _ in records))
+
 
 @require_serve
 class TestValidation(unittest.TestCase):

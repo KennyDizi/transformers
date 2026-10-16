@@ -150,7 +150,7 @@ class ChatCompletionHandler(BaseHandler):
             inputs = inputs.to(model.device)  # type: ignore[union-attr]
 
         gen_config = self._build_generation_config(body, model.generation_config, use_cb=use_cb)
-        # TODO: remove when CB supports per-request generation config
+        # Shared CB runtime. Sampling parameters from this request are applied when the request is submitted.
         if use_cb:
             gen_manager.init_cb(model, gen_config)
 

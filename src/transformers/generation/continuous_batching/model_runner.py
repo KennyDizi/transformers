@@ -59,15 +59,13 @@ class ModelRunner:
         cb_config: ContinuousBatchingConfig,
         inputs_and_outputs: ContinuousBatchingIOs | ContinuousBatchingAsyncIOs,
         cache: PagedAttentionCache,
-        do_sample: bool,
         return_logprobs: bool,
     ) -> None:
         # Main attributes
         self.logit_processor = logit_processor
         self.cb_config = cb_config
         self.inputs_and_outputs = inputs_and_outputs
-        # Helper attributes
-        self.do_sample = do_sample
+        # Helper attributes. Sampling is per request (see `_sample`); it is not a runner-wide flag.
         self.return_logprobs = return_logprobs
         self.use_cuda_graph_varlen, self.use_cuda_graph_decode = self.cb_config.cuda_graph_booleans
         self.cache = cache
@@ -128,7 +126,7 @@ class ModelRunner:
         the forward pass to use (varlen or decode), whether to use CUDA graphs (with the eventual capture of the graph)
         and torch compile."""
         # These tensors are device-resident, this is just pointer retrieval
-        carry_over_ids, prev_output_ids, output_ids = self.inputs_and_outputs.get_cb_kwargs()
+        carry_over_ids, prev_output_ids, output_ids, do_sample = self.inputs_and_outputs.get_cb_kwargs()
         # This is the stream on which the compute happens
         compute_stream = self.inputs_and_outputs.compute_stream
 
@@ -142,7 +140,7 @@ class ModelRunner:
         # If we are not using CUDA graphs, we perform the generation step and return
         if not use_cuda_graph:
             with stream_context(compute_stream):
-                forward_fn(model, batch_data, carry_over_ids, prev_output_ids, output_ids)
+                forward_fn(model, batch_data, carry_over_ids, prev_output_ids, output_ids, do_sample)
 
         # Otherwise, we either create or replay the graph (an accelerator is available in this path)
         else:
@@ -153,7 +151,7 @@ class ModelRunner:
                     graph.replay()
             # Otherwise, the graph does not exist, so we create it
             else:
-                args = (model, batch_data, carry_over_ids, prev_output_ids, output_ids)
+                args = (model, batch_data, carry_over_ids, prev_output_ids, output_ids, do_sample)
                 self._capture_graph(forward_fn, compute_stream, *args)
 
     def _get_forward_fn(self, use_block_table: bool) -> tuple[Callable, bool]:
@@ -185,6 +183,7 @@ class ModelRunner:
         carry_over_ids: torch.Tensor,
         prev_output_ids: torch.Tensor,
         output_ids: torch.Tensor,
+        do_sample: torch.Tensor,
     ) -> None:
         """This function performs the forward pass, logits processing, and sampling. This is what is either captured
         and/or compiled."""
@@ -214,22 +213,25 @@ class ModelRunner:
         else:
             scores = logits
 
-        # Sample next tokens
-        self._sample(scores, output_ids)
+        # Sample next tokens. `do_sample` is a static tensor updated before this call, one flag per logit row.
+        self._sample(scores, output_ids, do_sample)
 
-    def _sample(self, scores: torch.Tensor, output_ids: torch.Tensor) -> None:
-        """Private method to sample next tokens from the scores."""
-        # Apply softmax if we are sampling or if we are generating log probabilities
-        if self.do_sample or self.return_logprobs:
-            probs = nn.functional.softmax(scores[0], dim=-1)  # shape [num_logits, vocab_size]
-        else:
-            probs = scores.squeeze(0)  # shape [num_logits, vocab_size]
+    def _sample(self, scores: torch.Tensor, output_ids: torch.Tensor, do_sample: torch.Tensor) -> None:
+        """Sample next tokens. Greedy and sampled rows share this call.
 
-        # Retrieve next tokens through sampling or argmax
-        if self.do_sample:
-            next_tokens = torch.multinomial(probs, num_samples=1)  # shape [num_logits, 1]
-        else:
-            next_tokens = torch.argmax(probs, dim=-1, keepdim=True)  # shape [num_logits, 1]
+        Both the multinomial draw and the argmax run on every row. A Python branch on a request flag would be frozen
+        by `torch.compile` and by CUDA graph capture, and every later replay would follow the captured branch. The
+        per-row mask selects the token instead. `do_sample` is int32 storage, 0 for greedy and 1 for sampling, and may
+        be longer than the logit rows (padding and the static maximum batch).
+        """
+        row_logits = scores[0]  # shape [num_logits, vocab_size]
+        num_logits = row_logits.shape[0]
+        # Softmax is required for multinomial. Argmax uses the raw logits so a positive temperature cannot change it.
+        probs = nn.functional.softmax(row_logits, dim=-1)  # shape [num_logits, vocab_size]
+        sampled_tokens = torch.multinomial(probs, num_samples=1)  # shape [num_logits, 1]
+        greedy_tokens = torch.argmax(row_logits, dim=-1, keepdim=True)  # shape [num_logits, 1]
+        sample_rows = do_sample[:num_logits].unsqueeze(-1) != 0
+        next_tokens = torch.where(sample_rows, sampled_tokens, greedy_tokens)  # shape [num_logits, 1]
 
         # Maybe retrieve log probabilities
         if self.return_logprobs:

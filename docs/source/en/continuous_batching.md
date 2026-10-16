@@ -146,17 +146,24 @@ manager.cancel_request(request_id="my_request")
 
 ### Per-request sampling parameters
 
-Enable `per_request_processors` to apply `temperature`, `top_k`, and `top_p` independently per request within the same forward pass to allow different sampling parameters for different requests (creative, high-temperature outputs versus precise, low-temperature ones for example).
+Each request carries its own `do_sample` choice. Greedy and sampled requests share a batch. The forward pass selects the token with a mask inside the compiled, graph-captured step, so one request's choice cannot freeze the batch.
+
+Pass `do_sample`, `temperature`, `top_k`, and `top_p` to [`~ContinuousBatchingManager.add_request`]. Omitted values fall back to the [`GenerationConfig`] the manager was created with. `do_sample=False` is greedy even when the manager was created with sampling turned on, and a later request can sample even when the manager was created with `do_sample=False`.
+
+Set `per_request_processors=True` to give each request its own `temperature`, `top_k`, and `top_p`. Continuous batching then installs those warpers from the manager defaults, including when a single `generate` call would have skipped them (`do_sample=False`, `temperature=1`, `top_p=1`, or `top_k` unset). `top_k <= 0` disables top-k for that request. `transformers serve --continuous-batching` turns this flag on and forwards each request's sampling parameters. `temperature: 0` is greedy. A positive temperature samples.
 
 ```py
 cb_config = ContinuousBatchingConfig(per_request_processors=True)
-
-# each request gets its own sampling parameters
-manager.add_request(input_ids=inputs_a, temperature=0.9, top_p=0.95)
-manager.add_request(input_ids=inputs_b, temperature=0.1, top_k=10)
+manager = model.init_continuous_batching(
+    generation_config=GenerationConfig(do_sample=False, eos_token_id=-1),
+    continuous_batching_config=cb_config,
+)
+manager.start()
+manager.add_request(input_ids=input_ids, request_id="extract", do_sample=False)
+manager.add_request(input_ids=input_ids, request_id="chat", do_sample=True, temperature=0.7, top_p=0.9)
 ```
 
-Each parameter in [`GenerationConfig`] must be a non-default value in order to create the associated logits processor at runtime. For example, set `temperature` to a value other than `None` or `1` to support per-request temperature control. Requests with temperatures of `1` can still be created afterwards.
+`frequency_penalty`, `logit_bias`, and `stop` are not applied per request. `transformers serve` rejects a continuous-batching request that sets them instead of dropping the values.
 
 ### Retrieving results
 

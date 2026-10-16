@@ -29,6 +29,8 @@ transformers serve \
   --attn-implementation "sdpa"
 ```
 
+Requests that share the process do not share a sampling mode. `temperature: 0` is greedy. A positive `temperature` samples with that request's `top_p`. The first request only supplies the default temperature, top-p, and top-k. `frequency_penalty`, `logit_bias`, and `stop` are rejected: continuous batching does not apply them to one request, and the server does not ignore them.
+
 ## Quantization
 
 [Quantization](../quantization/overview) reduces memory usage by mapping weights to a lower precision. `transformers serve` is compatible with all quantization methods in Transformers. It supports pre-quantized models and runtime quantization.

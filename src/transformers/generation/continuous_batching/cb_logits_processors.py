@@ -72,7 +72,9 @@ class ContinuousBatchingLogitsProcessorList:
     On per-request processors:
         Some base processors have a per-request version adapted for CB and will be converted to their per-request
         version when this class is instantiated. This is the default behavior unless the flag `per_request_processors`
-        is set to False.
+        is set to False. `ensure_request_sampling_defaults` installs temperature, top-k, and top-p even when the
+        generation config would not have created them (`do_sample=False`, `temperature=1`, `top_p=1`, or no `top_k`),
+        using those config values as the per-request defaults.
     """
 
     def __init__(
@@ -178,6 +180,36 @@ class ContinuousBatchingLogitsProcessorList:
             f"Ignored logit_processor_kwargs: {problematic_keys}. {self.supported_keys = } and {self.ignored_keys = }"
         )
 
+    def ensure_request_sampling_defaults(self, *, temperature: float, top_k: int, top_p: float) -> None:
+        """Install per-request temperature, top-k, and top-p warpers when the generation config did not.
+
+        Defaults come from the manager's generation config. `temperature` must be strictly positive. `top_k <= 0`
+        leaves the distribution unfiltered. `top_p` is the nucleus threshold in `[0, 1]`.
+        """
+        if not any(
+            isinstance(processor, ContinuousBatchingTemperatureLogitsWarper) for processor in self.logits_processor
+        ):
+            self._insert_sampling_warper(ContinuousBatchingTemperatureLogitsWarper(temperature=temperature))
+            self.tensors_required += 1
+        if not any(isinstance(processor, ContinuousBatchingTopKLogitsWarper) for processor in self.logits_processor):
+            self._insert_sampling_warper(ContinuousBatchingTopKLogitsWarper(top_k=top_k))
+            self.tensors_required += 1
+        if not any(isinstance(processor, ContinuousBatchingTopPLogitsWarper) for processor in self.logits_processor):
+            self._insert_sampling_warper(ContinuousBatchingTopPLogitsWarper(top_p=top_p))
+            self.tensors_required += 1
+        self._retrieve_processors_kwargs()
+        self.do_processing = len(self.logits_processor) > 0
+
+    def _insert_sampling_warper(self, warper: ContinuousBatchingLogitsProcessor) -> None:
+        """Insert `warper` so temperature runs before top-k, and top-k before top-p."""
+        rank = _SAMPLING_WARPER_ORDER[type(warper)]
+        for index, existing in enumerate(self.logits_processor):
+            existing_rank = _SAMPLING_WARPER_ORDER.get(type(existing))
+            if existing_rank is not None and existing_rank > rank:
+                self.logits_processor.insert(index, warper)
+                return
+        self.logits_processor.append(warper)
+
     def fill_defaults(self, int32_tensor: torch.Tensor) -> None:
         """Fills the given tensor int32 tensor with the default values for this processor."""
         i = 0
@@ -218,8 +250,15 @@ class ContinuousBatchingTemperatureLogitsWarper(ContinuousBatchingLogitsProcesso
     supported_kwargs: dict[str, type] = {"temperature": float}
     ignored_kwargs: tuple[str, ...] = ()
 
-    def __init__(self, temperature_processor: TemperatureLogitsWarper) -> None:
-        self.temperature = temperature_processor.temperature
+    def __init__(
+        self, temperature_processor: TemperatureLogitsWarper | None = None, *, temperature: float | None = None
+    ) -> None:
+        if temperature_processor is not None:
+            self.temperature = float(temperature_processor.temperature)
+        elif temperature is not None:
+            self.temperature = float(temperature)
+        else:
+            raise ValueError("`temperature` is required to build a continuous batching temperature warper.")
 
     def fill_defaults(self, int32_tensor: torch.Tensor) -> None:
         """Fills the given tensor int32 tensor with the default temperature."""
@@ -238,6 +277,9 @@ class ContinuousBatchingTemperatureLogitsWarper(ContinuousBatchingLogitsProcesso
 
     def __call__(self, scores: torch.FloatTensor, tensor_arg: torch.Tensor) -> torch.FloatTensor:
         temperatures = tensor_arg[: scores.size(0)].view(dtype=torch.float32)  # shape [B]
+        # A non-positive temperature is not a valid scale. Clamp inside the captured step so one row cannot turn
+        # the whole batch into NaNs. Greedy requests should set do_sample instead of passing temperature 0.
+        temperatures = temperatures.clamp_min(1e-6)
         return scores / temperatures.unsqueeze(-1)  # broadcast [B, 1] over [B, V]
 
 
@@ -245,10 +287,23 @@ class ContinuousBatchingTopKLogitsWarper(ContinuousBatchingLogitsProcessor):
     supported_kwargs: dict[str, type] = {"top_k": int}
     ignored_kwargs: tuple[str, ...] = ("filter_value", "min_tokens_to_keep")
 
-    def __init__(self, top_k_processor: TopKLogitsWarper):
-        self.top_k = top_k_processor.top_k
-        self.filter_value = top_k_processor.filter_value
-        self.min_tokens_to_keep = top_k_processor.min_tokens_to_keep
+    def __init__(
+        self,
+        top_k_processor: TopKLogitsWarper | None = None,
+        *,
+        top_k: int | None = None,
+        filter_value: float = -float("inf"),
+        min_tokens_to_keep: int = 1,
+    ) -> None:
+        if top_k_processor is not None:
+            self.top_k = top_k_processor.top_k
+            self.filter_value = top_k_processor.filter_value
+            self.min_tokens_to_keep = top_k_processor.min_tokens_to_keep
+        else:
+            # top_k <= 0 means "keep the full distribution". The classic warper rejects that value.
+            self.top_k = 0 if top_k is None else int(top_k)
+            self.filter_value = filter_value
+            self.min_tokens_to_keep = min_tokens_to_keep
 
     def fill_defaults(self, int32_tensor: torch.Tensor) -> None:
         """Fills the given tensor int32 tensor with the default top_k."""
@@ -257,19 +312,32 @@ class ContinuousBatchingTopKLogitsWarper(ContinuousBatchingLogitsProcessor):
     def prepare_tensor_args(self, requests_with_new_token: list[FutureRequestState]) -> torch.Tensor:
         top_ks = []
         for request in requests_with_new_token:
-            top_k = request.state.logit_processor_kwargs.get("top_k", self.top_k)
-            top_k = max(top_k, self.min_tokens_to_keep)
+            top_k = int(request.state.logit_processor_kwargs.get("top_k", self.top_k))
+            # <= 0 disables the filter for this request. Do not bump it up to min_tokens_to_keep.
+            if top_k > 0:
+                top_k = max(top_k, self.min_tokens_to_keep)
+            else:
+                top_k = 0
             top_ks.append(top_k)
         # Prepare tensor arg with int32 as the main type
         tensor_args = torch.tensor(top_ks, dtype=torch.int32, device="cpu")
         return tensor_args
 
     def __call__(self, scores: torch.FloatTensor, tensor_arg: torch.Tensor) -> torch.FloatTensor:
-        """Applies top-k selection to the scores tensor (shape [B, V])."""
-        top_k = tensor_arg[: scores.size(0)]  # shape [B]
+        """Applies top-k selection to the scores tensor (shape [B, V]).
+
+        `top_k <= 0` keeps every token. The replacement is a tensor op so a captured graph can mix filtered and
+        unfiltered rows without branching on the request values.
+        """
+        vocab_size = scores.shape[-1]
+        top_k = tensor_arg[: scores.size(0)].to(dtype=torch.int64)  # shape [B]
+        top_k = top_k.clamp(min=0, max=vocab_size)
+        # 0 means "keep all": use the full vocabulary as k. clamp keeps a request that already asked for vocab_size.
+        top_k = top_k + (top_k == 0).to(dtype=top_k.dtype) * vocab_size
+        top_k = top_k.clamp(max=vocab_size)
         # Sort descending, get threshold at position (top_k - 1) which is the k-th largest
         sorted_scores = torch.sort(scores, dim=-1, descending=True)[0]  # [B, V]
-        top_k_indices = (top_k - 1).unsqueeze(-1).to(dtype=torch.int64)  # [B, 1]
+        top_k_indices = (top_k - 1).unsqueeze(-1)  # [B, 1]
         thresholds = sorted_scores.gather(dim=-1, index=top_k_indices)  # [B, 1]
         return scores.masked_fill(scores < thresholds, self.filter_value)
 
@@ -278,10 +346,24 @@ class ContinuousBatchingTopPLogitsWarper(ContinuousBatchingLogitsProcessor):
     supported_kwargs: dict[str, type] = {"top_p": float}
     ignored_kwargs: tuple[str, ...] = ("filter_value", "min_tokens_to_keep")
 
-    def __init__(self, top_p_processor: TopPLogitsWarper):
-        self.top_p = top_p_processor.top_p
-        self.filter_value = top_p_processor.filter_value
-        self.min_tokens_to_keep = top_p_processor.min_tokens_to_keep
+    def __init__(
+        self,
+        top_p_processor: TopPLogitsWarper | None = None,
+        *,
+        top_p: float | None = None,
+        filter_value: float = -float("inf"),
+        min_tokens_to_keep: int = 1,
+    ) -> None:
+        if top_p_processor is not None:
+            self.top_p = float(top_p_processor.top_p)
+            self.filter_value = top_p_processor.filter_value
+            self.min_tokens_to_keep = top_p_processor.min_tokens_to_keep
+        elif top_p is not None:
+            self.top_p = float(top_p)
+            self.filter_value = filter_value
+            self.min_tokens_to_keep = min_tokens_to_keep
+        else:
+            raise ValueError("`top_p` is required to build a continuous batching top-p warper.")
 
     def fill_defaults(self, int32_tensor: torch.Tensor) -> None:
         """Fills the given tensor int32 tensor with the default top_p."""
@@ -321,6 +403,12 @@ class ContinuousBatchingTopPLogitsWarper(ContinuousBatchingLogitsProcessor):
 
 # TODO: add non-per-request CB variants so the memory-efficient warpers work when `per_request_processors=False`.
 # TODO: fuse temperature + top-k + top-p into a single pass to reuse the softmax/sort and cut activation peak.
+# Insertion order for per-request sampling warpers. Temperature scales logits before top-k and top-p filter them.
+_SAMPLING_WARPER_ORDER = {
+    ContinuousBatchingTemperatureLogitsWarper: 0,
+    ContinuousBatchingTopKLogitsWarper: 1,
+    ContinuousBatchingTopPLogitsWarper: 2,
+}
 CLASSIC_TO_CB_PROCESSORS_MAP = {
     TemperatureLogitsWarper: ContinuousBatchingTemperatureLogitsWarper,
     TopKLogitsWarper: ContinuousBatchingTopKLogitsWarper,

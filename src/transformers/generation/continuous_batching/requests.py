@@ -138,6 +138,8 @@ class RequestState:
                                 SPLIT_PENDING_REMAINDER, DECODING, FINISHED, FAILED
         max_new_tokens (int | None): The maximum number of new tokens to generate.
         eos_token_id (None | int | list[int]): The ID(s) of the end-of-sequence tokens. Only used in post-init.
+        do_sample (bool): Whether this request samples. False selects the greedy token. Independent of other
+            requests in the same batch.
         _eos_token_ids (set[int]): The IDs of the end-of-sequence tokens, formatted as a set.
         streaming (bool): Whether to stream tokens as they're generated
         created_time (float): The time the request was created.
@@ -157,6 +159,9 @@ class RequestState:
     eos_token_id: int | list[int] | None = None  # ID(s) of the end-of-sequence tokens. Only used in post-init.
     num_children: int = 0  # Number of children requests
     logit_processor_kwargs: dict = field(default_factory=dict)  # Keyword arguments for the logits processor.
+    # Greedy when false. Set per request so a batch can mix greedy and sampled rows. Defaults to greedy, matching
+    # GenerationConfig's unset do_sample. add_request fills this from the request or the manager config.
+    do_sample: bool = False
 
     # Internal fields (for scheduling)
     tokens_to_process: list[int] = field(default_factory=list)  # Tokens IDs currently being processed
@@ -279,6 +284,7 @@ class RequestState:
             f"full_prompt_length={len(self.initial_tokens)}",
             f"allocated_blocks={self.allocated_blocks}",
             f"generated_tokens={self.generated_tokens}",
+            f"do_sample={self.do_sample}",
             f"logit_processor_kwargs={self.logit_processor_kwargs}",
         ]
         return "RequestState(\n\t" + ",\n\t".join(msg) + "\n)"
@@ -324,6 +330,7 @@ class RequestState:
             "eos_token_id": self.eos_token_id,
             "num_children": self.num_children,
             "logit_processor_kwargs": deepcopy(self.logit_processor_kwargs),
+            "do_sample": self.do_sample,
         }
 
     def create_equivalent_initial_request(self) -> "RequestState":

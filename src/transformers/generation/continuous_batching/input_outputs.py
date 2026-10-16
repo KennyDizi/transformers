@@ -164,6 +164,11 @@ class ContinuousBatchingIOs:
         full_attention_cumulative_seqlens_k = self._bulk_input_tensor[4, : max_requests_per_batch + 1]
         sliding_attention_cumulative_seqlens_k = self._bulk_input_tensor[5, : max_requests_per_batch + 1]
         self.carry_over_ids = self._bulk_input_tensor[6, :max_batch_tokens]  # only used for async API
+        # Per-logit-row sampling flag (0 greedy, 1 sample). Kept outside the bulk tensor so processor rows stay put.
+        # The compiled step indexes this storage; CUDA graph replay sees whatever was written before the replay.
+        self.do_sample = torch.zeros(
+            max_requests_per_batch, dtype=torch.int32, device=self.device, pin_memory=pin_memory
+        )
 
         # For sequence length of KV, the entries in the dict depend on the model
         self.cumulative_seqlens_k: dict[str, torch.Tensor] = {}
@@ -237,6 +242,7 @@ class ContinuousBatchingIOs:
         # Transfer static tensors
         with stream_context(stream):
             other._bulk_input_tensor.copy_(self._bulk_input_tensor, non_blocking=non_blocking)  # fast bulk transfer
+            other.do_sample.copy_(self.do_sample, non_blocking=non_blocking)
             # Only transfer block_table for decode-only batches (when it's actually used)
             if self.use_block_table:
                 other.block_table.copy_(self.block_table, non_blocking=non_blocking)
@@ -263,6 +269,8 @@ class ContinuousBatchingIOs:
 
         # Reset the attributes part of the bulk input tensor in one kernel
         self._bulk_input_tensor[: self.static_inputs, : q_len + 1].zero_()
+        # Stale flags from a larger previous batch must not sample a padded row.
+        self.do_sample.zero_()
         if full_reset:
             self._bulk_input_tensor[self.static_inputs :] = self.logits_processors_defaults
         self.max_length_q = 0
@@ -423,6 +431,8 @@ class ContinuousBatchingIOs:
             requests_in_batch=requests_in_batch,
             arg_storage=self._bulk_input_tensor[self.static_inputs :],
         )
+        # One flag per logit row, in the same order as the processors: requests that will emit a new token.
+        self._fill_do_sample(requests_in_batch)
 
         # Scalar attribute update
         self.total_seqlen_q = cumulative_seqlens_q[-1]
@@ -476,6 +486,14 @@ class ContinuousBatchingIOs:
                 for i, group_read_indices in enumerate(read_index):
                     self.read_index_storage[i, : len(group_read_indices)] = to_index_tensor(group_read_indices)
                     self.true_read_sizes[i] = len(group_read_indices)
+
+    def _fill_do_sample(self, requests_in_batch: list[FutureRequestState]) -> None:
+        """Write 0/1 sampling flags for requests that produce a new token. The buffer was zeroed by the reset."""
+        flags = [1 if request.state.do_sample else 0 for request in requests_in_batch if request.has_new_token]
+        if not flags:
+            return
+        values = torch.tensor(flags, dtype=torch.int32, device=self.do_sample.device)
+        self.do_sample[: values.shape[0]] = values
 
     def _get_num_sequences(self, use_padding: bool) -> int:
         """Get the number of sequences for the current batch, accounting for padding if there is any."""
@@ -549,11 +567,15 @@ class ContinuousBatchingIOs:
 
         return kwargs
 
-    def get_cb_kwargs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_cb_kwargs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns the tensors used inside the generation step that are not inputs to the model forward pass. In
-        synchronous batching, there is no carry over, so the only tensor that will be used is output_ids, but we still
-        return 3 tensors to have the same interface as when using async batching."""
-        return self.carry_over_ids, self.output_ids, self.output_ids
+        synchronous batching, there is no carry over, so the only tensors that will be used are output_ids and
+        do_sample, but we still return the carry-over tensors to have the same interface as async batching.
+
+        `do_sample` is returned from here, rather than read off this object inside the compiled step, so torch.compile
+        does not guard on which IO pair is current.
+        """
+        return self.carry_over_ids, self.output_ids, self.output_ids, self.do_sample
 
     def _get_graph_key(self) -> tuple[int, ...]:
         # Keys for decode fast path
@@ -759,13 +781,15 @@ class ContinuousBatchingAsyncIOs:
         self.compute_stream.wait_event(io_pair.h2d_over)
         return io_pair.device_io.get_model_kwargs(use_padding=use_padding)
 
-    def get_cb_kwargs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_cb_kwargs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns the tensors used inside the generation step that are not inputs to the model forward pass. Those
         tensors could be retrieved using this object, but it would trigger a recompile if using torch.compile. They are:
         - output_ids: the output ids of the current batch
         - prev_output_ids: the output ids of the previous batch, required to carry over outputs tokens of the previous
             batch to the input tokens of the next batch.
         - carry_over_ids: a mask representing how to carry over tokens.
+        - do_sample: per-row greedy-or-sample flags for the current batch. Passed in so compile does not guard on
+            which IO pair is current. The graph reads this storage, which the H2D copy updates before replay.
         """
         current_pair = self.io_pairs[self.current_pair]
         previous_pair = self.io_pairs[1 - self.current_pair]
@@ -773,6 +797,7 @@ class ContinuousBatchingAsyncIOs:
             current_pair.device_io.carry_over_ids,
             previous_pair.device_io.output_ids,
             current_pair.device_io.output_ids,
+            current_pair.device_io.do_sample,
         )
 
     # TODO: this should be moved to the model runner, and have it called conditioned on optional carry over ids

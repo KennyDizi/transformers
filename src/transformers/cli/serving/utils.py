@@ -823,19 +823,81 @@ class GenerateManager(BaseGenerateManager):
         pass  # inference thread is a daemon
 
 
+def _sampling_request_kwargs(gen_config: "GenerationConfig") -> dict[str, bool | float | int]:
+    """Sampling arguments for one CB request.
+
+    ``do_sample`` is always included. Temperature, top-p, and top-k are included when the parsed config has them.
+    Temperature ``0`` is not forwarded: it is not a valid scale, and the caller sets ``do_sample`` false for it.
+    Missing values fall back to the defaults the CB manager was initialized with.
+    """
+    kwargs: dict[str, bool | float | int] = {"do_sample": bool(gen_config.do_sample)}
+    temperature = gen_config.temperature
+    if isinstance(temperature, (int, float)) and not isinstance(temperature, bool) and float(temperature) > 0:
+        kwargs["temperature"] = float(temperature)
+    top_p = gen_config.top_p
+    if isinstance(top_p, (int, float)) and not isinstance(top_p, bool):
+        kwargs["top_p"] = float(top_p)
+    top_k = gen_config.top_k
+    if isinstance(top_k, int) and not isinstance(top_k, bool):
+        kwargs["top_k"] = top_k
+    return kwargs
+
+
+def _unsupported_continuous_batching_params(body: dict) -> list[str]:
+    """OpenAI fields that continuous batching would otherwise ignore.
+
+    A zero ``frequency_penalty``, an empty ``logit_bias``, or an empty ``stop`` do not change generation, so they
+    are not reported. The same parameters are also rejected when a ``generation_config`` JSON document sets
+    ``repetition_penalty``, ``sequence_bias``, or ``stop_strings``. Anything else in this set must be rejected:
+    continuous batching does not apply it to one request.
+    """
+    unsupported = []
+    frequency_penalty = body.get("frequency_penalty")
+    if (
+        isinstance(frequency_penalty, (int, float))
+        and not isinstance(frequency_penalty, bool)
+        and float(frequency_penalty) != 0.0
+    ):
+        unsupported.append("frequency_penalty")
+    logit_bias = body.get("logit_bias")
+    if isinstance(logit_bias, dict) and len(logit_bias) > 0:
+        unsupported.append("logit_bias")
+    stop = body.get("stop")
+    if stop not in (None, "", [], ()):
+        unsupported.append("stop")
+
+    # The same fields can arrive inside a raw generation_config JSON document, under their HF names.
+    raw_generation_config = body.get("generation_config")
+    if isinstance(raw_generation_config, str) and raw_generation_config:
+        try:
+            parsed = json.loads(raw_generation_config)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            penalty = parsed.get("repetition_penalty")
+            if isinstance(penalty, (int, float)) and not isinstance(penalty, bool) and float(penalty) != 1.0:
+                unsupported.append("repetition_penalty")
+            sequence_bias = parsed.get("sequence_bias")
+            if sequence_bias not in (None, {}, []):
+                unsupported.append("sequence_bias")
+            stop_strings = parsed.get("stop_strings")
+            if stop_strings not in (None, "", [], ()):
+                unsupported.append("stop_strings")
+    return unsupported
+
+
 class CBGenerateManager(BaseGenerateManager):
     """Continuous batching generation via paged attention.
 
     Translates between the handler's text-level asyncio.Queue and CB's
-    token-level interface. Per-request: ``max_new_tokens``, ``eos_token_id``.
+    token-level interface. Each request carries its own ``max_new_tokens``,
+    ``eos_token_id``, ``do_sample``, and, when set, ``temperature``, ``top_p``,
+    and ``top_k``. The CB runtime is created on the first request. That
+    request's generation config supplies the default sampling values; later
+    requests override them.
 
-    The CB manager is initialized lazily on the first request via
-    :meth:`ensure_initialized`, using that request's ``gen_config`` for shared
-    sampling params (temperature, top_p, do_sample).
-
-    .. todo:: Remove :meth:`init_cb` when CB supports per-request
-       generation config. At that point, ``gen_config`` can be passed directly
-       to ``add_request`` and the CB manager no longer needs a shared config.
+    ``frequency_penalty``, ``logit_bias``, and ``stop`` are rejected by the
+    handlers while continuous batching is on. They are not applied per request.
     """
 
     def __init__(self, cb_config: "ContinuousBatchingConfig | None" = None):
@@ -843,21 +905,51 @@ class CBGenerateManager(BaseGenerateManager):
         self._cb_config = cb_config
 
     def init_cb(self, model: "PreTrainedModel", gen_config: "GenerationConfig") -> None:
-        """Initialize the CB manager on first call with the request's generation config.
+        """Initialize the shared CB runtime on the first request.
 
-        .. todo:: Remove when CB supports per-request generation config.
+        The generation config supplies default sampling values. Each later request passes its own ``do_sample``,
+        ``temperature``, ``top_p``, and ``top_k``. Per-request processors are turned on so those overrides exist even
+        when this first config is greedy.
 
         Args:
             model (`PreTrainedModel`): The loaded model (must support ``init_continuous_batching``).
-            gen_config (`GenerationConfig`): Generation config used for shared sampling params.
+            gen_config (`GenerationConfig`): Generation config used for the manager's default sampling values.
         """
         if self._cb is not None:
             return
 
-        self._cb = model.init_continuous_batching(
-            generation_config=gen_config, continuous_batching_config=self._cb_config
-        )
+        from dataclasses import replace
+
+        from transformers import ContinuousBatchingConfig
+
+        cb_config = self._cb_config
+        if cb_config is None:
+            cb_config = ContinuousBatchingConfig(per_request_processors=True)
+        else:
+            cb_config = replace(cb_config, per_request_processors=True)
+
+        self._cb = model.init_continuous_batching(generation_config=gen_config, continuous_batching_config=cb_config)
         self._cb.start()
+
+    def _submit_cb_request(
+        self,
+        input_ids: list[int],
+        gen_config: "GenerationConfig",
+        request_id: str,
+        streaming: bool,
+    ) -> str | None:
+        """Queue one request, forwarding that request's sampling parameters."""
+        cb = self._cb
+        if cb is None:
+            raise RuntimeError("CB manager not initialized. Call `init_cb()` first.")
+        return cb.add_request(
+            input_ids,
+            request_id=request_id,
+            streaming=streaming,
+            max_new_tokens=gen_config.max_new_tokens,
+            eos_token_id=gen_config.eos_token_id,
+            **_sampling_request_kwargs(gen_config),
+        )
 
     def is_alive(self) -> bool:
         """Whether the CB worker is healthy. ``True`` before ``init_cb()`` is called."""
@@ -893,13 +985,10 @@ class CBGenerateManager(BaseGenerateManager):
         text_queue: asyncio.Queue = asyncio.Queue()
 
         input_ids = inputs["input_ids"]
-        request_id = cb.add_request(
-            input_ids,
-            request_id=request_id,
-            streaming=True,
-            max_new_tokens=gen_config.max_new_tokens,
-            eos_token_id=gen_config.eos_token_id,
-        )
+        submitted_id = self._submit_cb_request(input_ids, gen_config, request_id, streaming=True)
+        if submitted_id is None:
+            raise RuntimeError(f"CB did not accept request {request_id}.")
+        request_id = submitted_id
         # ProcessorMixin exposes the fast tokenizer as .tokenizer; PreTrainedTokenizerFast is already one.
         rust_tokenizer = getattr(processor, "tokenizer", processor)._tokenizer  # type: ignore[union-attr]
         streamer = CBStreamer(
@@ -957,13 +1046,11 @@ class CBGenerateManager(BaseGenerateManager):
 
         cb.register_result_handler(request_id, _on_result)
 
-        cb.add_request(
-            input_ids,
-            request_id=request_id,
-            max_new_tokens=gen_config.max_new_tokens,
-            streaming=False,
-            eos_token_id=gen_config.eos_token_id,
-        )
+        submitted_id = self._submit_cb_request(input_ids, gen_config, request_id, streaming=False)
+        if submitted_id is None:
+            with cb.output_router._lock:
+                cb.output_router.result_handlers.pop(request_id, None)
+            raise RuntimeError(f"CB did not accept request {request_id}.")
         result = await future
         # CB signals a failed request by setting ``error`` (and ``status = FAILED``) on the
         # delivered GenerationOutput, often with empty ``generated_tokens``. Surface it instead
@@ -1172,10 +1259,25 @@ class BaseHandler:
             if generation_config.max_new_tokens is None or generation_config.max_new_tokens < 1024:
                 generation_config.max_new_tokens = 1024
 
+        if use_cb:
+            unsupported = _unsupported_continuous_batching_params(body)
+            if unsupported:
+                from fastapi import HTTPException
+
+                names = ", ".join(f"`{name}`" for name in unsupported)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Continuous batching cannot apply {names} to this request. These parameters would be "
+                        "ignored, so the request is rejected. Remove them, or serve without --continuous-batching."
+                    ),
+                )
+
         if body.get("temperature") is not None:
-            generation_config.temperature = float(body["temperature"])
-            if float(body["temperature"]) == 0.0:
-                generation_config.do_sample = False
+            temperature = float(body["temperature"])
+            generation_config.temperature = temperature
+            # OpenAI semantics: temperature 0 is greedy, and a positive temperature samples.
+            generation_config.do_sample = temperature != 0.0
         if body.get("top_p") is not None:
             generation_config.top_p = float(body["top_p"])
         if body.get("seed") is not None:

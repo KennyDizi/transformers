@@ -57,6 +57,7 @@ from transformers.generation.continuous_batching.continuous_api import (
 )
 from transformers.generation.continuous_batching.distributed import DistributedHelper
 from transformers.generation.continuous_batching.input_outputs import build_attention_mask
+from transformers.generation.continuous_batching.model_runner import ModelRunner
 from transformers.generation.continuous_batching.offloading_manager import OffloadingManager
 from transformers.generation.continuous_batching.requests import (
     GenerationOutput,
@@ -977,6 +978,127 @@ class ContinuousBatchingNoAcceleratorTest(unittest.TestCase):
                 os.environ.pop("WORLD_SIZE", None)
             else:
                 os.environ["WORLD_SIZE"] = original_ws
+
+    def test_sample_selects_per_row_inside_one_call(self) -> None:
+        """Greedy and sampled rows are chosen in one `_sample` call, with no Python branch on the mask."""
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.return_logprobs = False
+        # Row 0 argmax is 1. Row 1 argmax is 0. The fake draw is token 2 for both rows.
+        scores = torch.tensor([[[0.0, 4.0, 1.0], [2.0, 0.5, 0.1]]], dtype=torch.float32)
+        output_ids = torch.full((1, 4), -1, dtype=torch.int32)
+        greedy_then_sample = torch.tensor([0, 1, 1], dtype=torch.int32)
+
+        def fake_multinomial(probs, num_samples=1, replacement=False, generator=None):
+            self.assertEqual(tuple(probs.shape), (2, 3))
+            self.assertEqual(num_samples, 1)
+            return torch.tensor([[2], [2]], dtype=torch.long)
+
+        multinomial_path = "transformers.generation.continuous_batching.model_runner.torch.multinomial"
+        with patch(multinomial_path, side_effect=fake_multinomial) as mocked:
+            runner._sample(scores, output_ids, greedy_then_sample)
+        self.assertEqual(mocked.call_count, 1)
+        # Mask [0, 1] keeps argmax on row 0 and the draw on row 1. The extra flag is padding.
+        self.assertEqual(output_ids[0, :2].tolist(), [1, 2])
+
+        output_ids.fill_(-1)
+        sample_then_greedy = torch.tensor([1, 0], dtype=torch.int32)
+        with patch(multinomial_path, side_effect=fake_multinomial):
+            runner._sample(scores, output_ids, sample_then_greedy)
+        self.assertEqual(output_ids[0, :2].tolist(), [2, 0])
+
+    def test_mixed_greedy_and_sampled_requests_share_one_batch(self) -> None:
+        """A greedy request and a sampled request run in one continuous-batching batch on CPU.
+
+        The manager is created with `do_sample=False`, which used to force every later request to be greedy.
+        Logits are uniform, so the greedy request is all zeros and the sampled request is not.
+        """
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        config = LlamaConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            attn_implementation="sdpa",
+            bos_token_id=1,
+            eos_token_id=1,
+            pad_token_id=0,
+            tie_word_embeddings=False,
+        )
+        model = LlamaForCausalLM(config).eval()
+        model.lm_head.weight.data.zero_()
+
+        cb_config = ContinuousBatchingConfig(
+            num_blocks=8,
+            page_size=16,
+            max_batch_tokens=32,
+            max_requests_per_batch=4,
+            use_cuda_graph=False,
+            use_async_batching=False,
+            auto_switch_to_flash=False,
+            per_request_processors=True,
+            allow_block_sharing=False,
+            seed=0,
+        )
+        # First-request config is greedy. Per-request warpers must still exist for the sampled request.
+        generation_config = GenerationConfig(do_sample=False, max_new_tokens=6, eos_token_id=-1)
+        manager = model.init_continuous_batching(
+            generation_config=generation_config, continuous_batching_config=cb_config
+        )
+        processor_names = [type(processor).__name__ for processor in manager.logit_processor.logits_processor]
+        self.assertIn("ContinuousBatchingTemperatureLogitsWarper", processor_names)
+        self.assertIn("ContinuousBatchingTopKLogitsWarper", processor_names)
+        self.assertIn("ContinuousBatchingTopPLogitsWarper", processor_names)
+
+        records: list[tuple[list[int], list[int], list[int]]] = []
+        original_sample = ModelRunner._sample
+
+        def wrapped_sample(runner, scores, output_ids, do_sample):
+            num_rows = scores.shape[1]
+            mask = [int(value) for value in do_sample[:num_rows].detach().to("cpu").tolist()]
+            greedy_tokens = [int(value) for value in scores[0].argmax(dim=-1).detach().to("cpu").tolist()]
+            original_sample(runner, scores, output_ids, do_sample)
+            written = [int(value) for value in output_ids[0, :num_rows].detach().to("cpu").tolist()]
+            records.append((mask, written, greedy_tokens))
+
+        manager.add_request([1, 2, 3, 4], request_id="greedy", do_sample=False, max_new_tokens=6, eos_token_id=-1)
+        manager.add_request(
+            [5, 6, 7, 8],
+            request_id="sampled",
+            do_sample=True,
+            temperature=2.0,
+            top_p=1.0,
+            top_k=0,
+            max_new_tokens=6,
+            eos_token_id=-1,
+        )
+        results = {}
+        with patch.object(ModelRunner, "_sample", wrapped_sample):
+            manager.start()
+            try:
+                deadline = time.perf_counter() + 60
+                while len(results) < 2 and time.perf_counter() < deadline:
+                    result = manager.get_result(timeout=1)
+                    if result is not None and result.is_finished():
+                        self.assertIsNone(result.error, result.error)
+                        self.assertEqual(result.status, RequestStatus.FINISHED)
+                        results[result.request_id] = result
+                    elif not manager.is_running():
+                        break
+            finally:
+                manager.stop(block=True, timeout=10)
+
+        self.assertEqual(set(results), {"greedy", "sampled"})
+        self.assertEqual(results["greedy"].generated_tokens, [0] * 6)
+        self.assertNotEqual(results["sampled"].generated_tokens, [0] * 6)
+        self.assertTrue(any(0 in mask and 1 in mask for mask, _, _ in records))
+        for mask, written, greedy_tokens in records:
+            for flag, token, greedy_token in zip(mask, written, greedy_tokens):
+                if flag == 0:
+                    self.assertEqual(token, greedy_token)
 
 
 class ContinuousBatchingPauseTest(unittest.TestCase):
